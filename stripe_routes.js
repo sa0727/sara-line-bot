@@ -21,8 +21,7 @@ function toLowerSafe(s) {
 function toId(maybeIdOrObj) {
   if (!maybeIdOrObj) return null;
   if (typeof maybeIdOrObj === "string") return maybeIdOrObj;
-  if (typeof maybeIdOrObj === "object" && typeof maybeIdOrObj.id === "string")
-    return maybeIdOrObj.id;
+  if (typeof maybeIdOrObj === "object" && typeof maybeIdOrObj.id === "string") return maybeIdOrObj.id;
   return null;
 }
 
@@ -35,9 +34,7 @@ function isActiveUserRow(row) {
 }
 
 async function getUser(lineUserId) {
-  const r = await query(`select * from users where line_user_id=$1 limit 1`, [
-    lineUserId,
-  ]);
+  const r = await query(`select * from users where line_user_id=$1 limit 1`, [lineUserId]);
   return r.rows[0] || null;
 }
 
@@ -48,9 +45,7 @@ async function upsertUserPaid({
   status,
   currentPeriodEndUnix, // seconds
 }) {
-  const paidUntil = currentPeriodEndUnix
-    ? new Date(currentPeriodEndUnix * 1000)
-    : null;
+  const paidUntil = currentPeriodEndUnix ? new Date(currentPeriodEndUnix * 1000) : null;
 
   await query(
     `
@@ -84,11 +79,7 @@ async function upsertUserPaid({
 }
 
 async function markUserUnpaidBySubscription(subId, status) {
-  // subIdからユーザー特定して落とす
-  const r = await query(
-    `select line_user_id from users where stripe_subscription_id=$1 limit 1`,
-    [subId]
-  );
+  const r = await query(`select line_user_id from users where stripe_subscription_id=$1 limit 1`, [subId]);
   const row = r.rows[0];
   if (!row) return;
 
@@ -106,9 +97,7 @@ async function markUserUnpaidBySubscription(subId, status) {
 }
 
 async function alreadyProcessed(eventId) {
-  const r = await query(`select 1 from processed_events where event_id=$1`, [
-    eventId,
-  ]);
+  const r = await query(`select 1 from processed_events where event_id=$1`, [eventId]);
   return r.rowCount > 0;
 }
 
@@ -124,22 +113,17 @@ function mountStripeRoutes(app) {
   app.post("/stripe/checkout", app.jsonParser, async (req, res) => {
     try {
       const { lineUserId } = req.body || {};
-      if (!lineUserId)
-        return res
-          .status(400)
-          .json({ ok: false, error: "missing_lineUserId" });
+      if (!lineUserId) return res.status(400).json({ ok: false, error: "missing_lineUserId" });
 
       const existing = await getUser(lineUserId);
       if (isActiveUserRow(existing)) {
         return res.json({ ok: true, alreadyPaid: true });
       }
 
-      const baseUrl = process.env.APP_BASE_URL; // https://sara-line-bot.onrender.com
-      const priceId = process.env.STRIPE_PRICE_ID; // ¥980/月のPrice ID
-      if (!baseUrl)
-        return res.status(500).json({ ok: false, error: "missing_APP_BASE_URL" });
-      if (!priceId)
-        return res.status(500).json({ ok: false, error: "missing_STRIPE_PRICE_ID" });
+      const baseUrl = process.env.APP_BASE_URL;
+      const priceId = process.env.STRIPE_PRICE_ID;
+      if (!baseUrl) return res.status(500).json({ ok: false, error: "missing_APP_BASE_URL" });
+      if (!priceId) return res.status(500).json({ ok: false, error: "missing_STRIPE_PRICE_ID" });
 
       const session = await stripe.checkout.sessions.create({
         mode: "subscription",
@@ -172,7 +156,6 @@ function mountStripeRoutes(app) {
       console.error("[stripe/checkout] error routine:", e?.routine);
       console.error("[stripe/checkout] error stack:", e?.stack);
 
-      // ★一時的にデバッグ情報を返す（原因が取れたら戻してOK）
       return res.status(500).json({
         ok: false,
         error: "checkout_failed",
@@ -193,11 +176,7 @@ function mountStripeRoutes(app) {
     let event;
     try {
       const sig = req.headers["stripe-signature"];
-      event = stripe.webhooks.constructEvent(
-        req.body,
-        sig,
-        process.env.STRIPE_WEBHOOK_SECRET
-      );
+      event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
     } catch (err) {
       console.error("[stripe/webhook] signature verify failed", err.message);
       return res.status(400).send(`Webhook Error: ${err.message}`);
@@ -212,18 +191,14 @@ function mountStripeRoutes(app) {
         case "checkout.session.completed": {
           const session = event.data.object;
 
-          const lineUserId =
-            session.client_reference_id || session.metadata?.lineUserId;
+          const lineUserId = session.client_reference_id || session.metadata?.lineUserId;
           if (!lineUserId) break;
 
           const subId = toId(session.subscription);
           const customerId = toId(session.customer);
 
-          // subscription を取って current_period_end を確定
           let sub = null;
-          if (subId) {
-            sub = await stripe.subscriptions.retrieve(subId);
-          }
+          if (subId) sub = await stripe.subscriptions.retrieve(subId);
 
           await upsertUserPaid({
             lineUserId,
@@ -233,7 +208,6 @@ function mountStripeRoutes(app) {
             currentPeriodEndUnix: sub?.current_period_end || null,
           });
 
-          // payments 側も反映（存在していれば更新）
           await query(
             `
             update payments
@@ -252,7 +226,6 @@ function mountStripeRoutes(app) {
           const subId = sub?.id;
           if (!subId) break;
 
-          // subId→lineUserId は users から引く（最小実装）
           const r = await query(
             `select line_user_id from users where stripe_subscription_id=$1 limit 1`,
             [subId]
@@ -267,6 +240,7 @@ function mountStripeRoutes(app) {
             status: sub.status,
             currentPeriodEndUnix: sub.current_period_end,
           });
+
           break;
         }
 
@@ -285,7 +259,6 @@ function mountStripeRoutes(app) {
       return res.status(200).json({ received: true });
     } catch (e) {
       console.error("[stripe/webhook] handler error", e);
-      // 失敗時は processed に入れない（再送でリカバリできるように）
       return res.status(500).json({ received: true, error: "handler_failed" });
     }
   });
@@ -296,11 +269,7 @@ function mountStripeRoutes(app) {
   });
 
   app.get("/billing/cancel", (req, res) => {
-    res
-      .status(200)
-      .send(
-        "キャンセルOK💋 続けたいならLINEで『▶ 続きを見る（有料）』って送って。"
-      );
+    res.status(200).send("キャンセルOK💋 続けたいならLINEで『▶ 続きを見る（有料）』って送って。");
   });
 }
 

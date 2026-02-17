@@ -12,7 +12,6 @@ const { computePaidScore, formatPaidScoreForUser } = require("./paid_score");
 const { analyzeImageToConsultText } = require("./vision_ocr");
 
 // ★Stripe（月額課金）
-// 事前に ./stripe_routes.js を用意してある前提（前の回答の内容）
 const { mountStripeRoutes, getUser, isActiveUserRow } = require("./stripe_routes");
 
 const app = express();
@@ -20,6 +19,7 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const { query } = require("./db");
 
+// ★DBテーブル自動作成（app.listenより前で1回だけ）
 async function ensureTables() {
   try {
     await query(`
@@ -56,8 +56,6 @@ async function ensureTables() {
     console.error("❌ ensureTables failed:", e);
   }
 }
-
-// ★ app.listen より前で必ず呼ぶ
 ensureTables();
 
 const config = {
@@ -162,12 +160,10 @@ function isScreenshotPermissionText(text) {
 }
 
 function shouldTriggerImageParse(text) {
-  // 「OK」だけ送っても動くし、追撃文が来ても動く
   const t = (text || "").trim();
   if (!t) return false;
   if (/^(ok|OK|次|つぎ|続けて|続き|見て|みて|解析|お願い)$/.test(t)) return true;
   if (/(送った|貼った|送信|載せた|見てほしい)/.test(t)) return true;
-  // pendingImage がある限り、基本は true に寄せる（読めない問題を優先的に潰す）
   return true;
 }
 
@@ -187,9 +183,6 @@ function dumpSession(session) {
   };
 }
 
-/**
- * 無料で「挨拶/雑談っぽい入力」を恋愛に戻す
- */
 function isSmallTalkLike(text) {
   const t = (text || "").trim();
   if (!t) return true;
@@ -200,46 +193,30 @@ function isSmallTalkLike(text) {
   return false;
 }
 
-/**
- * 恋愛シグナルが薄い時に、恋愛の状況提示を促す
- */
 function looksLikeRomance(text) {
   const t = (text || "").trim();
   if (!t) return false;
-  // ざっくりで良い。誤判定しても「恋の状況を1〜2行で」に戻すだけ。
   return /(既読|未読|返信|LINE|連絡|告白|復縁|好き|気になる|彼氏|彼女|片思い|デート|会いたい|脈|距離|冷たい|別れ|元カレ|元カノ|付き合)/.test(
     t
   );
 }
 
-/**
- * problem/goal に「わかった」「OK」みたいなノイズが混ざるのを防ぐ
- * - 複数行なら「意味のある行」だけを拾う
- */
 function pickMeaningfulLine(text) {
   const lines = tidyLines(text).split("\n").map((x) => x.trim()).filter(Boolean);
   if (lines.length === 0) return "";
 
-  const noise = /^(うん|はい|ok|OK|了解|りょ|わかった|わかりました|なるほど|そう|そうそう|よし|とりあえず|一旦|すみません|ごめん)[。!！]*$/i;
+  const noise =
+    /^(うん|はい|ok|OK|了解|りょ|わかった|わかりました|なるほど|そう|そうそう|よし|とりあえず|一旦|すみません|ごめん)[。!！]*$/i;
   const meaningful = lines.filter((l) => !noise.test(l));
 
-  // 意味ある行があれば最後を採用（ユーザーが最後に本題を書きがち）
   if (meaningful.length > 0) return meaningful[meaningful.length - 1];
-
-  // 全部ノイズっぽいなら、最後の行を返す（完全空は避ける）
   return lines[lines.length - 1];
 }
 
-/**
- * 無料体験：軽い提案（案）
- * - 完成例文を量産しない
- * - “方向性/次の一手候補/NG/雛形1〜2” だけ
- */
 function buildFreeLightAdvice(problem, goal) {
   const p = (problem || "").trim();
   const g = (goal || "").trim();
 
-  // ざっくりカテゴリ
   const isReadIgnored = /(既読無視|未読無視|既読スルー|未読スルー|返信ない|返ってこない)/.test(p);
   const isReconcile = /(復縁|別れ|元カレ|元カノ)/.test(p) || /(復縁)/.test(g);
   const isConfess = /(告白|付き合)/.test(g) || /(告白|付き合)/.test(p);
@@ -302,7 +279,7 @@ function buildFreeLightAdvice(problem, goal) {
     ngList = ["反応に一喜一憂して態度がブレる", "駆け引きで試す"];
   }
 
-  const advice = [
+  return [
     "【軽い提案（案）】",
     `・方向性：${direction}`,
     `・まずやること：${doList.map((x) => `\n  - ${x}`).join("")}`,
@@ -312,8 +289,6 @@ function buildFreeLightAdvice(problem, goal) {
     `- ${templates[0]}`,
     `- ${templates[1]}`,
   ].join("\n");
-
-  return advice;
 }
 
 app.post("/webhook", line.middleware(config), async (req, res) => {
@@ -334,11 +309,7 @@ async function handleEvent(event) {
 
   const session = getSession(userId);
 
-  // --------------------------
   // ★課金状態：DBが真実
-  // - Mapのstateより先にDBを見て、PAIDの可否を確定
-  // - DBが落ちてもFREEは動く（PAIDは安全側で閉じる）
-  // --------------------------
   try {
     const u = await getUser(userId);
     if (isActiveUserRow(u)) {
@@ -350,15 +321,10 @@ async function handleEvent(event) {
     console.error("[PAID_CHECK] failed", e);
   }
 
-  // --------------------------
-  // 画像メッセージ：即返信＋キュー保存（ここでは解析しない）
-  // --------------------------
+  // 画像メッセージ：即返信＋キュー保存
   if (event.message?.type === "image") {
     try {
-      session.paid.pendingImage = {
-        messageId: event.message.id,
-        at: Date.now(),
-      };
+      session.paid.pendingImage = { messageId: event.message.id, at: Date.now() };
 
       return replyText(
         event,
@@ -378,17 +344,14 @@ async function handleEvent(event) {
     }
   }
 
-  // テキスト以外（スタンプ等）は無視
   if (event.message?.type !== "text") return;
 
   let text = (event.message.text || "").trim();
 
-  // #dump
   if (text === "#dump") {
     return replyText(event, "```json\n" + JSON.stringify(dumpSession(session), null, 2) + "\n```");
   }
 
-  // リセット
   if (text === "リセット") {
     userStore.delete(userId);
     return replyText(
@@ -399,9 +362,6 @@ async function handleEvent(event) {
     );
   }
 
-  // --------------------------
-  // 🔴 スクショ送付確認は即レス（AI呼ばない）
-  // --------------------------
   if (isScreenshotPermissionText(text)) {
     return replyText(
       event,
@@ -411,12 +371,9 @@ async function handleEvent(event) {
     );
   }
 
-  // --------------------------
-  // ★pendingImage があれば、先に解析してテキスト合流
-  // --------------------------
   if (session?.paid?.pendingImage && shouldTriggerImageParse(text)) {
     const pending = session.paid.pendingImage;
-    session.paid.pendingImage = null; // 二重処理防止
+    session.paid.pendingImage = null;
 
     try {
       const dataUrl = await fetchLineImageAsDataUrl(pending.messageId);
@@ -436,14 +393,12 @@ async function handleEvent(event) {
         at: new Date().toISOString(),
       };
 
-      // 相談文として合流（suggestedUserTextが最優先）
       const synthetic =
         vision.suggestedUserText ||
         tidyLines(
           `（トークスクショ要約）\n${vision.summary || "要約が取れなかった"}\n\n相談：この状況で次の一手を考えて。`
         );
 
-      // ユーザーの追撃文は補足として末尾に添える
       text = tidyLines(`${synthetic}\n\n（補足）${text}`);
     } catch (e) {
       console.error("[IMAGE] analyze failed:", e);
@@ -454,13 +409,9 @@ async function handleEvent(event) {
     }
   }
 
-  // --------------------------
-  // 無料フェーズ（雑談を恋愛に戻す＋軽い提案を必ず出す）
-  // --------------------------
+  // 無料フェーズ
   if (session.state === "FREE") {
-    // 1) まだ problem がない時：雑談なら恋愛に戻す
     if (!session.answers.problem) {
-      // 雑談 or 恋愛シグナル薄い → 恋愛状況を要求
       if (isSmallTalkLike(text) || !looksLikeRomance(text)) {
         return replyText(
           event,
@@ -473,16 +424,10 @@ async function handleEvent(event) {
       }
 
       session.answers.problem = pickMeaningfulLine(text);
-      return replyText(
-        event,
-        `うん。
-いま一番したいことは？（告白/復縁/距離縮めたい など）`
-      );
+      return replyText(event, `うん。\nいま一番したいことは？（告白/復縁/距離縮めたい など）`);
     }
 
-    // 2) goal 未設定
     if (!session.answers.goal) {
-      // goalっぽくない/迷い → 代表例を出して聞き直す
       if (isSmallTalkLike(text) || text.length <= 1) {
         return replyText(
           event,
@@ -500,20 +445,16 @@ async function handleEvent(event) {
       }
 
       session.answers.goal = pickMeaningfulLine(text);
-
-      // ✅ FREEの締め：軽い提案（案）を出してから、有料導線（= PAID_GATE）
       session.state = "PAID_GATE";
 
-      const problem = session.answers.problem;
-      const goal = session.answers.goal;
-      const advice = buildFreeLightAdvice(problem, goal);
+      const advice = buildFreeLightAdvice(session.answers.problem, session.answers.goal);
 
       return replyText(
         event,
         `状況は整理できたわ💋
 
-・いまの状況：${problem}
-・狙い：${goal}
+・いまの状況：${session.answers.problem}
+・狙い：${session.answers.goal}
 
 ${advice}
 
@@ -526,11 +467,8 @@ ${advice}
     }
   }
 
-  // --------------------------
-  // 有料ゲート：Checkoutリンクを出す（PAID解放はWebhookで確定）
-  // --------------------------
+  // 有料ゲート
   if (session.state === "PAID_GATE" && isPaidButtonText(text)) {
-    // すでに課金済みなら即入れる（保険）
     try {
       const u = await getUser(userId);
       if (isActiveUserRow(u)) {
@@ -539,7 +477,6 @@ ${advice}
       }
     } catch {}
 
-    // 連打でリンク大量発行を抑える（60秒）
     if (session.paid.checkoutIssuedAt && Date.now() - session.paid.checkoutIssuedAt < 60 * 1000) {
       return replyText(
         event,
@@ -550,7 +487,6 @@ ${advice}
     }
     session.paid.checkoutIssuedAt = Date.now();
 
-    // Checkout URL を作る：同一サーバの /stripe/checkout を叩く（最短実装）
     const baseUrl = process.env.APP_BASE_URL;
 
     try {
@@ -583,17 +519,11 @@ ${advice}
       );
     } catch (e) {
       console.error("[PAYWALL] checkout failed", e);
-      return replyText(
-        event,
-        `今、決済リンクの発行で詰まった💋
-もう一回「▶ 続きを見る（有料）」って送って。`
-      );
+      return replyText(event, `今、決済リンクの発行で詰まった💋\nもう一回「▶ 続きを見る（有料）」って送って。`);
     }
   }
 
-  // --------------------------
   // 有料チャット
-  // --------------------------
   if (session.state === "PAID_CHAT") {
     const aiReply = await generatePaidChatSara({
       openai,
@@ -605,7 +535,6 @@ ${advice}
     session.paid.history.push({ role: "user", content: text });
     session.paid.history.push({ role: "assistant", content: aiReply });
 
-    // CHATモードではスコア出さない（paid_score.js 側でも弾くが保険）
     const score = computePaidScore({
       userText: text,
       mode: session.paid.mode,
@@ -615,7 +544,6 @@ ${advice}
 
     let finalReply = aiReply;
 
-    // mode=CHATは保存もしない（dumpが汚れない）
     if (score && score.enabled && !/CHAT/i.test(String(session.paid.mode || ""))) {
       session.paid.lastScore = score;
       finalReply += `\n\n――\n${formatPaidScoreForUser(score)}`;
@@ -630,27 +558,6 @@ ${advice}
 }
 
 const PORT = process.env.PORT || 3000;
-
-async function ensureTables() {
-  try {
-    await query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        line_user_id TEXT UNIQUE NOT NULL,
-        stripe_customer_id TEXT,
-        subscription_id TEXT,
-        subscription_status TEXT,
-        created_at TIMESTAMP DEFAULT NOW()
-      );
-    `);
-
-    console.log("✅ users table ensured");
-  } catch (err) {
-    console.error("❌ table creation error:", err);
-  }
-}
-
-ensureTables();
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
