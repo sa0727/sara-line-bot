@@ -1,4 +1,7 @@
 // stripe_routes.js
+
+console.log("🔥 STRIPE ROUTES VERSION 2026-02-18-A");
+
 const Stripe = require("stripe");
 const { query } = require("./db");
 
