@@ -1,479 +1,586 @@
 require("dotenv").config();
-const OpenAI = require("openai");
-
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
 const express = require("express");
 const line = require("@line/bot-sdk");
+const OpenAI = require("openai");
 
-const { buildFreeAnalysis } = require("./free_templates");
-const { applyFreeNLU, nextMissingQuestion } = require("./free_nlu");
+const { buildPaidContent } = require("./paid_templates");
+const { generatePaidChatSara, trimHistory } = require("./paid_engine");
+const { analyzeImageToConsultText } = require("./vision_ocr");
 
-// paid系（分割版）
-const { PaidPhase, updatePaidPhaseFromUserText, adviceSignature } = require("./paid_state");
-const { generatePaidChatSara, extractQuotedMessage } = require("./paid_engine");
-const { detectImportantEvent, updatePaidSummaryIfNeeded } = require("./paid_memory");
-const {
-  buildHardRules,
-  buildMessagePatterns,
-  inferTemperatureScore,
-  buildTemperatureGuidance,
-} = require("./paid_policy");
-const { applyPaidHeuristics, extractWithMiniAI, extractPlanFromAi } = require("./paid_extractors");
+// 既存のプロジェクトにある前提（あれば使う）
+let computePaidScore = null;
+let formatPaidScoreForUser = null;
+try {
+  ({ computePaidScore, formatPaidScoreForUser } = require("./paid_score"));
+} catch {
+  // paid_score.js が無い or 読めない環境でも動くように（CHATでは使わない想定）
+}
+
+let detectImportantEvent = null;
+let updatePaidSummaryIfNeeded = null;
+try {
+  ({ detectImportantEvent, updatePaidSummaryIfNeeded } = require("./paid_memory"));
+} catch {
+  // paid_memory.js が無い環境でも動くように
+}
 
 const app = express();
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
 };
-
 const client = new line.Client(config);
 
-/**
- * メモリ保存（開発用）
- */
 const userStore = new Map();
 
-/**
- * 状態定義
- */
-const State = Object.freeze({
-  IDLE: "IDLE",
-
-  // （旧）ボタン式フロー（残してOK：保険）
-  READ_Q1_LAST_MET: "READ_Q1_LAST_MET",
-  READ_Q2_LAST_SENDER: "READ_Q2_LAST_SENDER",
-  READ_Q3_SILENCE: "READ_Q3_SILENCE",
-  READ_Q4_GOAL: "READ_Q4_GOAL",
-  READ_Q5_FEAR: "READ_Q5_FEAR",
-
-  // ★無料：自由入力でスロット収集
-  FREE_COLLECT: "FREE_COLLECT",
-
-  // 無料分析完了
-  FREE_ANALYSIS_DONE: "FREE_ANALYSIS_DONE",
-
-  // 有料
-  PAID_INPUT: "PAID_INPUT",
-  PAID_CHAT: "PAID_CHAT",
-});
-
-function getUserId(event) {
-  return event?.source?.userId || "anonymous";
+// 同一ユーザーのイベント処理を直列化（画像→OK の順序崩れ対策）
+const userLocks = new Map();
+function runWithUserLock(userId, fn) {
+  const prev = userLocks.get(userId) || Promise.resolve();
+  const next = prev.catch(() => {}).then(fn);
+  userLocks.set(
+    userId,
+    next.finally(() => {
+      if (userLocks.get(userId) === next) userLocks.delete(userId);
+    })
+  );
+  return next;
 }
 
-function createFreshSession() {
+function freshSession() {
   return {
-    state: State.IDLE,
-    answers: {
-      problem: null,
-      lastMet: null,
-      lastSender: null,
-      silence: null,
-      goal: null,
-      fear: null,
-
-      relationshipStage: null,
-      partnerSpeed: null,
-      partnerType: null,
-    },
+    state: "FREE",
+    answers: {},
     paid: {
-      summary: null,
+      mode: "CHAT",
+      phase: "UNKNOWN",
       history: [],
+      lastScore: null,
 
-      phase: PaidPhase.UNKNOWN,
+      // 長期メモ（要約）
+      summary: "",
       turns: 0,
-      lastSentText: null,
-      lastAdviceSig: null,
-      lastClarifyQ: null,
       lastImportantEventAtTurn: 0,
-      plan: { action: null, timing: null, draft: null, ng: [] },
+
+      // 呼び名（任意・不特定多数対応）
+      // calledByOther: 相手→自分 の呼び方（例：先輩）
+      // calledByUser: 自分→相手 の呼び方（例：Aちゃん）
+      labels: {
+        calledByOther: "",
+        calledByUser: "",
+      },
+
+      // ★追加：呼び名を「画像後に1回だけ」促すためのフラグ
+      labelsAskedAfterImage: false,
+
+      // 画像解析用
+      pendingImage: null, // { messageId, at }
+      lastImage: null, // 1ターン限定で model に渡す
+      lastImageCache: null, // デバッグ用：最後に読んだ画像の記録
+      lastImageActiveOnce: false, // true の時、次の返信生成後に lastImage を消す
     },
   };
 }
 
 function getSession(userId) {
-  if (!userStore.has(userId)) {
-    userStore.set(userId, createFreshSession());
-  }
+  if (!userStore.has(userId)) userStore.set(userId, freshSession());
   return userStore.get(userId);
 }
 
-function resetSession(userId) {
-  userStore.set(userId, createFreshSession());
+function tidyLines(s) {
+  return (s || "")
+    .toString()
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
-/**
- * LINE Quick Reply
- */
-function quickReply(items) {
+async function replyText(event, text) {
+  return client.replyMessage(event.replyToken, {
+    type: "text",
+    text: tidyLines(text),
+  });
+}
+
+function labelOrDefault(v, fallback) {
+  const s = (v || "").trim();
+  return s ? s : fallback;
+}
+
+function isPaidButtonText(text) {
+  const t = (text || "").trim();
+  return (
+    t === "▶ 続きを見る（有料）" ||
+    t === "続きを見る（有料）" ||
+    /続き.*有料/.test(t) ||
+    (t.includes("▶") && t.includes("有料"))
+  );
+}
+
+function isScreenshotPermissionText(text) {
+  const t = (text || "").trim();
+  return (
+    /(スクショ|画像|LINE).*(送ってもいい|貼ってもいい|見せていい)/.test(t) ||
+    /サラに.*(送ってもいい|貼ってもいい|見せていい)/.test(t)
+  );
+}
+
+function shouldTriggerImageParse(text) {
+  const t = (text || "").trim();
+  if (!t) return false;
+  if (/^(ok|OK|次|つぎ|続けて|続き|見て|みて|解析|お願い)$/.test(t)) return true;
+  if (/(送った|貼った|送信|載せた|見てほしい)/.test(t)) return true;
+  return true;
+}
+
+async function fetchLineImageAsDataUrl(messageId) {
+  const stream = await client.getMessageContent(messageId);
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  const buf = Buffer.concat(chunks);
+
+  const isPng =
+    buf.length >= 8 &&
+    buf
+      .slice(0, 8)
+      .equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  const mime = isPng ? "image/png" : "image/jpeg";
+  return `data:${mime};base64,${buf.toString("base64")}`;
+}
+
+function dumpSession(session) {
   return {
-    items: items.map((label) => ({
-      type: "action",
-      action: { type: "message", label, text: label },
-    })),
+    state: session.state,
+    answers: session.answers,
+    paid: {
+      mode: session.paid?.mode,
+      phase: session.paid?.phase,
+      labels: session.paid?.labels,
+      labelsAskedAfterImage: session.paid?.labelsAskedAfterImage,
+      historyLen: session.paid?.history?.length || 0,
+      summaryLen: (session.paid?.summary || "").length,
+      turns: session.paid?.turns || 0,
+      lastScore: session.paid?.lastScore || null,
+      pendingImage: session.paid?.pendingImage || null,
+      lastImage: session.paid?.lastImage || null,
+      lastImageCache: session.paid?.lastImageCache || null,
+      lastImageActiveOnce: session.paid?.lastImageActiveOnce || false,
+    },
   };
 }
 
-async function replyText(event, text, qrLabels = null) {
-  const message = { type: "text", text };
-  if (qrLabels?.length) message.quickReply = quickReply(qrLabels);
-  return client.replyMessage(event.replyToken, message);
-}
+// 無料は「受け止め＋浅い整理＋方向性（案）＋NG」まで（具体例文や深掘りは有料）
+function buildFreeLiteAdvice({ problem, goal }) {
+  const g = (goal || "").trim();
+  let direction = "まずは相手の温度と前提（関係性/距離感）を揃える。";
+  let ng = "いきなり重い確認・詰問・長文連投。";
 
-function normalize(text) {
-  return (text || "").trim();
-}
-
-/**
- * サラの相槌（おねえ口調）
- */
-function pick(arr) {
-  return arr[Math.floor(Math.random() * arr.length)];
-}
-
-function saraAck(kind = "normal") {
-  const normal = [
-    "うん、分かった。\n焦ると手を間違えるから、ここは一個ずつ整理するわよ💋",
-    "OK…状況は見えてきた。\nでも今は結論を急がない。順番にいくわ💋",
-    "大丈夫、まだ詰んでない。\nちゃんと整理すれば立て直せるから、続けて💋",
-    "うん。\n不安で暴走しやすい局面。だから“確認”ね💋",
-  ];
-
-  const ask = [
-    "よし。\nここ外すと全部ズレる。ちゃんと答えて💋",
-    "分かった。\n次が肝。ここ誤魔化す人ほどこじらせるのよ💋",
-    "うんうん。\n次、ここ聞くわ。ここで判断が決まる💋",
-  ];
-
-  return kind === "ask" ? pick(ask) : pick(normal);
-}
-
-/**
- * 入口メニュー
- */
-async function sendStartMenu(event) {
-  return replyText(event, "いらっしゃい💋\nどれで悩んでる？", [
-    "既読無視",
-    "脈あり診断（準備中）",
-    "告白（準備中）",
-    "復縁（準備中）",
-  ]);
-}
-
-/**
- * 無料：既読無視（自由入力開始）
- */
-async function startReadFlow(event, session) {
-  session.answers.problem = "既読無視";
-  session.state = State.FREE_COLLECT;
-
-  return replyText(
-    event,
-    "あ〜…既読無視ね。\nそれ、心が削られるやつ。\n\n状況を一気に書いて。\n例）「会ってない。既読3日。会いたい。重いと思われるのが怖い」\n短くてOKよ💋"
-  );
-}
-
-/**
- * 有料開始：入力促し
- */
-async function handlePaywallContent(event, session) {
-  session.state = State.PAID_INPUT;
-  session.paid.phase = PaidPhase.UNKNOWN;
-
-  return replyText(
-    event,
-    "ここから有料よ💋\n\n今の状況をそのまま書いて。\n例：\n・返信きた\n・既読ついたけど返事ない\n・まだ送ってない\n\nそのまま送って。",
-    null
-  );
-}
-
-/**
- * （旧）ボタン式フロー：残してOK（保険）
- */
-async function handleReadFlow(event, session, text) {
-  const t = normalize(text);
-
-  if (session.state === State.READ_Q1_LAST_MET) {
-    session.answers.lastMet = t;
-    session.state = State.READ_Q2_LAST_SENDER;
-    return replyText(event, "Q2｜最後に送ったのは誰？", ["自分", "相手"]);
+  if (/告白/.test(g)) {
+    direction = "告白は『気持ち』より先に“関係の土台”を作るのが勝ち筋♡";
+    ng = "雰囲気任せの突然告白／返事を急かす／相手の負担を盛る言い方。";
+  } else if (/復縁/.test(g)) {
+    direction = "復縁は『連絡再開→小さな成功体験→会う』の順で積むの♡";
+    ng = "いきなり謝罪爆撃／未練長文／相手の罪悪感に頼る動き。";
+  } else if (/距離|仲良く|近づ/.test(g)) {
+    direction = "距離を縮めるなら『会話の頻度』より“安心感の一貫性”よ💋";
+    ng = "反応に一喜一憂して態度がブレる／駆け引きで試す。";
   }
 
-  if (session.state === State.READ_Q2_LAST_SENDER) {
-    session.answers.lastSender = t;
-    session.state = State.READ_Q3_SILENCE;
-    return replyText(event, "Q3｜既読無視の期間は？", ["数時間", "1日", "3日以上"]);
-  }
+  return tidyLines(`
+いい、無料で言えるのは“ここまで”ね💋
 
-  if (session.state === State.READ_Q3_SILENCE) {
-    session.answers.silence = t;
-    session.state = State.READ_Q4_GOAL;
-    return replyText(event, "Q4｜ゴールは？", ["会いたい", "仲直りしたい", "付き合いたい", "見極めたい"]);
-  }
+・いまの状況：${problem ? problem : "（未入力）"}
+・狙い：${goal ? goal : "（未入力）"}
 
-  if (session.state === State.READ_Q4_GOAL) {
-    session.answers.goal = t;
-    session.state = State.READ_Q5_FEAR;
-    return replyText(event, "Q5｜いちばん怖いのは？", [
-      "嫌われる",
-      "他に好きな人がいる",
-      "どうでもいいと思われる",
-      "重いと思われる",
-      "分からない",
-    ]);
-  }
+【軽い助言（案）】
+・方向性：${direction}
+・まずやること：相手の反応が分かる材料を集める（直近のやり取り／相手の言い回し／既読未読）
+・NG：${ng}
 
-  if (session.state === State.READ_Q5_FEAR) {
-    session.answers.fear = t;
-    session.state = State.FREE_ANALYSIS_DONE;
-    const analysis = buildFreeAnalysis(session.answers);
-    return replyText(event, analysis, ["▶ 続きを見る（有料）", "今日はここまで", "メニュー"]);
-  }
+ここから先は“設計”に入る。
+勝ちたいなら、有料でいくわ♡
 
-  return replyText(event, "いったんメニューに戻る？", ["メニュー"]);
+（進むなら「▶ 続きを見る（有料）」って送って）
+  `);
 }
 
 /**
- * Webhook
+ * 呼び名パース（不特定多数対応）
+ * 例：
+ *  相手→自分=先輩
+ *  自分→相手=Aちゃん
+ *  相手->自分: 先輩
+ *  自分->相手 未設定
  */
-app.get("/", (req, res) => res.send("LINE bot server running"));
+function parseLabelsFromText(text) {
+  const t = (text || "").trim();
+  if (!t) return null;
+
+  const wantChange = /^(呼び名変更|呼び名リセット|ラベル変更)$/i.test(t);
+
+  const out = { calledByOther: "", calledByUser: "", wantChange };
+
+  const norm = t.replace(/→/g, "->").replace(/＝/g, "=").replace(/：/g, ":");
+
+  // 相手->自分
+  {
+    const m = norm.match(/相手\s*->\s*自分\s*[:=]\s*([^\n\r]+)/);
+    if (m && m[1]) out.calledByOther = m[1].trim();
+  }
+  // 自分->相手
+  {
+    const m = norm.match(/自分\s*->\s*相手\s*[:=]\s*([^\n\r]+)/);
+    if (m && m[1]) out.calledByUser = m[1].trim();
+  }
+
+  const clean = (s) => {
+    const v = (s || "").trim();
+    if (!v) return "";
+    if (/^(未設定|なし|特にない|ない)$/i.test(v)) return "";
+    return v.slice(0, 20);
+  };
+
+  out.calledByOther = clean(out.calledByOther);
+  out.calledByUser = clean(out.calledByUser);
+
+  if (!out.calledByOther && !out.calledByUser && !out.wantChange) return null;
+  return out;
+}
+
+function formatQuoteTurns(quoteTurns, labels) {
+  const q = Array.isArray(quoteTurns) ? quoteTurns.filter(Boolean).slice(0, 2) : [];
+  if (!q.length) return "";
+
+  // 表示ラベル：USERは「相手があなたを呼ぶ呼び名」、OTHERは「あなたが相手を呼ぶ呼び名」
+  const userLabel = labelOrDefault(labels?.calledByOther, "あなた");
+  const otherLabel = labelOrDefault(labels?.calledByUser, "相手");
+
+  const fmt = (x) => {
+    const sp =
+      x.speaker === "USER" ? userLabel : x.speaker === "OTHER" ? otherLabel : "不明";
+    return `${sp}『${String(x.text || "").trim()}』`;
+  };
+
+  if (q.length === 1) return fmt(q[0]);
+  return `${fmt(q[0])} / ${fmt(q[1])}`;
+}
 
 app.post("/webhook", line.middleware(config), async (req, res) => {
   try {
-    await Promise.all(req.body.events.map(handleEvent));
-    res.status(200).send("OK");
+    const events = req.body.events || [];
+    for (const ev of events) {
+      const uid = ev?.source?.userId;
+      if (!uid) continue;
+      await runWithUserLock(uid, () => handleEvent(ev));
+    }
+    res.status(200).end();
   } catch (err) {
-    console.error("Webhook error:", err);
-    res.status(500).end();
+    console.error("webhook error", err);
+    res.status(200).end();
   }
 });
 
-/**
- * ざっくり「方針まとめ」出したいトリガー（任意）
- */
-function shouldRecapPlan(text) {
-  const t = (text || "").trim();
-  return /どうする|どうしたら|どうしよ|まだ送ってない|送れてない|迷ってる|送る？|送っていい|いまから/.test(t);
-}
+async function handleEvent(event) {
+  if (event.type !== "message") return;
+  const userId = event.source?.userId;
+  if (!userId) return;
 
-function formatPlanRecap(plan) {
-  if (!plan) return null;
-  const parts = [];
-  if (plan.action) {
-    parts.push(
-      `方針：${
-        plan.action === "send" ? "送る" : plan.action === "wait" ? "待つ" : plan.action === "confirm" ? "確認" : "様子見"
-      }`
-    );
-  }
-  if (plan.timing) parts.push(`タイミング：${plan.timing}`);
-  if (plan.draft) parts.push(`文面：\n「${plan.draft}」`);
-  if (Array.isArray(plan.ng) && plan.ng.length) parts.push(`やっちゃダメ：${plan.ng.slice(0, 3).join("／")}`);
-  return parts.join("\n");
-}
+  const session = getSession(userId);
 
-/**
- * 有料処理（PAID_INPUT / PAID_CHAT 共通）
- */
-async function runPaidTurn(event, session, text, isFirstTurn) {
-  // 1) ルールベース更新（paid側）
-  applyPaidHeuristics(text, session.answers, session);
-
-  // 念のため phase 更新（重複でもOK）
-  updatePaidPhaseFromUserText(session, text);
-
-  // 返信きた局面では plan をリセット（古い指示で迷子防止）
-  if (session.paid.phase === PaidPhase.AFTER_REPLY) {
-    session.paid.plan = { action: null, timing: null, draft: null, ng: [] };
-  }
-
-  const importantHit = detectImportantEvent(text);
-
-  session.paid.history.push({ role: "user", content: text });
-
-  // 2) ミニAI補助：必要なときだけ（情報が欠けてる場合）
-  const needMini =
-    !session.answers.relationshipStage ||
-    !session.answers.partnerSpeed ||
-    !session.answers.partnerType ||
-    !session.answers.lastSender;
-
-  if (needMini) {
-    const extracted = await extractWithMiniAI({
-      openai,
-      userText: text,
-      answers: session.answers,
-    });
-
-    if (extracted) {
-      for (const [k, v] of Object.entries(extracted)) {
-        if (v == null) continue;
-        if (session.answers[k] == null || String(session.answers[k]).trim() === "") {
-          session.answers[k] = v;
-        }
-      }
-      // 反映後にもう一回 phase 更新（lastSender が埋まる想定）
-      updatePaidPhaseFromUserText(session, text);
-    }
-  }
-
-  // 3) policy組み立て（本番=evalと同一）
-  const hardRules = buildHardRules({ answers: session.answers, phase: session.paid.phase });
-  const patterns = buildMessagePatterns();
-
-  const tempScore = inferTemperatureScore({
-    userText: text,
-    answers: session.answers,
-    phase: session.paid.phase,
-  });
-  const temperatureGuidance = buildTemperatureGuidance(tempScore);
-
-  // 4) 本体AI
-  const aiText = await generatePaidChatSara({
-    openai,
-    answers: session.answers,
-    history: session.paid.history,
-    userText: text,
-    paidSummary: session.paid.summary,
-    paidMeta: {
-      phase: session.paid.phase,
-      lastSentText: session.paid.lastSentText,
-      lastClarifyQ: session.paid.lastClarifyQ,
-      lastAdviceSig: session.paid.lastAdviceSig,
-      hardRules,
-      patterns,
-      temperatureGuidance,
-    },
-  });
-
-  // 5) plan抽出（運用ログ/リキャップ用）
-  const plan = await extractPlanFromAi({ openai, aiText });
-  if (plan) session.paid.plan = plan;
-
-  session.paid.history.push({ role: "assistant", content: aiText });
-
-  // 6) ループ防止ログ更新
-  const quoted = extractQuotedMessage(aiText);
-  if (quoted) session.paid.lastSentText = quoted;
-
-  // 確認質問っぽい短文を記録（連発防止の材料）
-  if ((/\?$|？$/.test(aiText) && aiText.length <= 160) || /それ、あたし/.test(aiText)) {
-    session.paid.lastClarifyQ = aiText;
-  } else {
-    session.paid.lastClarifyQ = null;
-  }
-
-  const shortFacts = `${session.answers.relationshipStage || ""}|${session.answers.partnerSpeed || ""}|${
-    session.answers.partnerType || ""
-  }|${session.answers.goal || ""}`;
-  session.paid.lastAdviceSig = adviceSignature(session.paid.phase, quoted || "", shortFacts);
-
-  session.paid.turns += 1;
-
-  // 7) summary 自動更新
-  await updatePaidSummaryIfNeeded({
-    openai,
-    session,
-    userText: text,
-    aiText,
-    importantEventHit: importantHit,
-  });
-
-  // state 遷移
-  if (isFirstTurn) session.state = State.PAID_CHAT;
-
-  // （任意）ユーザーが「どうする？」系なら、直近planを短く追記（使い勝手UP）
-  let extra = "";
-  if (shouldRecapPlan(text) && session.paid.plan) {
-    const recap = formatPlanRecap(session.paid.plan);
-    if (recap) extra = `\n\n――\n${recap}`;
-  }
-
-  if (isFirstTurn) {
+  // 画像：即返信＋pendingImage保存（解析はしない）
+  if (event.message?.type === "image") {
+    session.paid.pendingImage = { messageId: event.message.id, at: Date.now() };
     return replyText(
       event,
-      aiText + extra + "\n\n送ったら結果（相手の返事 or 状況）をそのまま貼って。次の一手出す💋",
-      ["メニュー"]
+      `受け取った💋
+今のスクショ、次のメッセージで読み取る。
+
+「OK」って送って。
+（個人情報は隠していい）`
     );
   }
 
-  return replyText(event, aiText + extra, ["メニュー"]);
-}
+  if (event.message?.type !== "text") return;
+  let text = (event.message.text || "").trim();
 
-async function handleEvent(event) {
-  if (event.type !== "message" || event.message.type !== "text") return;
+  // #dump
+  if (text === "#dump") {
+    return replyText(event, "```json\n" + JSON.stringify(dumpSession(session), null, 2) + "\n```");
+  }
 
-  const userId = getUserId(event);
-  const session = getSession(userId);
-  const text = normalize(event.message.text);
-
-  // 共通コマンド（完全一致だけ）
+  // リセット
   if (text === "リセット") {
-    resetSession(userId);
-    return sendStartMenu(event);
-  }
-  if (text === "メニュー") {
-    resetSession(userId);
-    return sendStartMenu(event);
+    userStore.delete(userId);
+    return replyText(
+      event,
+      `いらっしゃい💋
+サラのバーへようこそ。
+
+恋愛の話、ここでは逃がさない♡
+まず状況をそのまま吐きな。`
+    );
   }
 
-  // 有料：最初の入力
-  if (session.state === State.PAID_INPUT) {
+  // 「スクショ送ってもいい？」系は即レス（AIに投げない）
+  if (isScreenshotPermissionText(text)) {
+    return replyText(
+      event,
+      `送って💋
+トークスクショでも文章でもOK。
+個人情報は隠していい♡
+
+貼ったら「OK」って言いな。こっちで読む。`
+    );
+  }
+
+  // 呼び名変更コマンド（任意）
+  if (/^呼び名変更$/i.test(text) && session.state === "PAID_CHAT") {
+    session.paid.labels.calledByOther = "";
+    session.paid.labels.calledByUser = "";
+    // 画像後に一回聞くフラグも戻す（=また促して良い）
+    session.paid.labelsAskedAfterImage = false;
+    return replyText(
+      event,
+      `いいわ💋 呼び名をリセットした。
+もう一回だけ送って。
+
+相手→自分=（例：先輩）
+自分→相手=（例：Aちゃん）
+
+未設定でもOK。`
+    );
+  }
+
+  // PAID_CHAT 中に呼び名セットを拾う（未設定はスキップ）
+  if (session.state === "PAID_CHAT") {
+    const parsed = parseLabelsFromText(text);
+    if (parsed) {
+      if (parsed.wantChange) {
+        session.paid.labels.calledByOther = "";
+        session.paid.labels.calledByUser = "";
+        session.paid.labelsAskedAfterImage = false;
+      }
+      if (parsed.calledByOther) session.paid.labels.calledByOther = parsed.calledByOther;
+      if (parsed.calledByUser) session.paid.labels.calledByUser = parsed.calledByUser;
+
+      const onlyLabelLike =
+        /^(\s*(相手|自分)\s*(->|→)\s*(自分|相手)\s*[:=].*)+$/m.test(
+          text.replace(/→/g, "->").replace(/＝/g, "=").replace(/：/g, ":")
+        );
+
+      if (onlyLabelLike) {
+        const me = labelOrDefault(session.paid.labels.calledByOther, "あなた");
+        const them = labelOrDefault(session.paid.labels.calledByUser, "相手");
+        return replyText(
+          event,
+          `了解♡ 呼び名セットした。\n${me} / ${them} でいくわ💋\n\n続けて、素材（相手の返信本文 or スクショ or 既読未読）を出しな。`
+        );
+      }
+      // ラベル以外の相談も入ってるなら、そのまま通常処理へ続行
+    }
+  }
+
+  // pendingImage 合流（次のテキストで解析）
+  if (session?.paid?.pendingImage && shouldTriggerImageParse(text)) {
+    const pending = session.paid.pendingImage;
+    session.paid.pendingImage = null;
+
     try {
-      return await runPaidTurn(event, session, text, true);
+      const dataUrl = await fetchLineImageAsDataUrl(pending.messageId);
+
+      const userLabel = labelOrDefault(session.paid.labels.calledByOther, "あなた");
+      const otherLabel = labelOrDefault(session.paid.labels.calledByUser, "相手");
+
+      const vision = await analyzeImageToConsultText({
+        openai,
+        dataUrl,
+        hintText: `LINEのトークスクショ。重要：右側の吹き出し＝相談者（USER）、左側の吹き出し＝相手（OTHER）。右(USER)は「${userLabel}」、左(OTHER)は「${otherLabel}」として扱って。`,
+      });
+
+      const lastImageObj = {
+        kind: vision.kind,
+        speakerConvention: vision.speakerConvention || "RIGHT_IS_USER",
+        summary: vision.summary || null,
+        quoteTurns: Array.isArray(vision.quoteTurns) ? vision.quoteTurns.slice(0, 2) : [],
+        ambiguousRefs: Array.isArray(vision.ambiguousRefs) ? vision.ambiguousRefs.slice(0, 5) : [],
+        userIntent: vision.userIntent || null,
+        extractedLinesCount: Array.isArray(vision.extractedLines) ? vision.extractedLines.length : 0,
+        dialogueTurnsCount: Array.isArray(vision.dialogueTurns) ? vision.dialogueTurns.length : 0,
+        missingQuestions: Array.isArray(vision.missingQuestions) ? vision.missingQuestions : [],
+        at: new Date().toISOString(),
+      };
+
+      // 1ターン限定で使う & デバッグ用キャッシュ
+      session.paid.lastImage = lastImageObj;
+      session.paid.lastImageCache = lastImageObj;
+      session.paid.lastImageActiveOnce = true;
+
+      const synthetic =
+        vision.suggestedUserText ||
+        tidyLines(
+          `（トークスクショ要約）
+${vision.summary || "要約が取れなかった"}
+
+相談：この状況で次の一手を考えて。`
+        );
+
+      const quoteLabel = formatQuoteTurns(vision.quoteTurns, session.paid.labels);
+      const quoteLine = quoteLabel
+        ? `拾ったセリフ：${quoteLabel}`
+        : `拾ったセリフ：${userLabel}『（短いセリフ）』/${otherLabel}『（短いセリフ）』`;
+
+      const imageMeta = vision.summary
+        ? `【画像あり】最初に必ず2行：\n1) 読めた要点：${String(vision.summary).slice(
+            0,
+            140
+          )}\n2) ${quoteLine}\nそして “右＝${userLabel}、左＝${otherLabel}” の前提で答える。文脈が曖昧なら設計の前に確認質問を1〜2個だけ。`
+        : `【画像あり】最初に必ず2行：\n1) 読めた要点：〜\n2) ${quoteLine}\nそして “右＝${userLabel}、左＝${otherLabel}” の前提で答える。文脈が曖昧なら確認質問を1〜2個だけ。`;
+
+      text = tidyLines(`${imageMeta}\n${synthetic}\n\n（補足）${text}`);
     } catch (e) {
-      console.error("PAID AI ERROR:", e?.status, e?.code, e?.message);
-      return replyText(event, "ごめん、今ちょっと詰まった。もう一回送って💋");
+      console.error("[IMAGE] analyze failed:", e);
+      return replyText(
+        event,
+        `画像は受け取った。で、今ちょっと読み取りがコケた💋
+
+悪いけど、スクショの要点をテキストで1〜3行で貼って♡
+どこが一番引っかかってる？（嫉妬/温度差/告白/返信待ち など）`
+      );
     }
   }
 
-  // 有料：会話継続
-  if (session.state === State.PAID_CHAT) {
+  // ====== FREE ======
+  if (session.state === "FREE") {
+    if (!session.answers.problem) {
+      session.answers.problem = text;
+      return replyText(
+        event,
+        `ふぅん。状況は掴んだ♡\n\nで、いま一番したいことは何？（告白/復縁/距離縮めたい など）`
+      );
+    }
+
+    if (!session.answers.goal) {
+      session.answers.goal = text;
+      session.state = "PAID_GATE";
+      return replyText(
+        event,
+        buildFreeLiteAdvice({
+          problem: session.answers.problem,
+          goal: session.answers.goal,
+        })
+      );
+    }
+  }
+
+  // ====== PAID_GATE ======
+  if (session.state === "PAID_GATE" && isPaidButtonText(text)) {
+    session.state = "PAID_CHAT";
+    return replyText(event, buildPaidContent(session.answers));
+  }
+
+  // ====== PAID_CHAT ======
+  if (session.state === "PAID_CHAT") {
+    const recentHistory = trimHistory(
+      session.paid.history,
+      Number(process.env.PAID_CHAT_HISTORY_MAX || 20)
+    );
+
+    const aiReply = await generatePaidChatSara({
+      openai,
+      answers: session.answers,
+      summary: session.paid.summary,
+      history: recentHistory,
+      userText: text,
+      mode: session.paid.mode,
+      phase: session.paid.phase,
+      lastImage: session.paid.lastImage, // ★1ターン限定
+      labels: session.paid.labels,
+    });
+
+    session.paid.history.push({ role: "user", content: text });
+    session.paid.history.push({ role: "assistant", content: aiReply });
+    session.paid.turns = Number(session.paid.turns || 0) + 1;
+
+    // ★ lastImage 1ターン限定化：返信生成が終わったら消す（cacheは残す）
+    if (session.paid.lastImageActiveOnce) {
+      session.paid.lastImageActiveOnce = false;
+      session.paid.lastImage = null;
+    }
+
+    // ★ 画像後の「呼び名」促しは、未設定の時だけ1回だけ
+    let finalReply = aiReply;
+    const noLabels =
+      !String(session.paid.labels.calledByOther || "").trim() &&
+      !String(session.paid.labels.calledByUser || "").trim();
+
+    // “画像を読んだ直後のターン”でのみ促す（lastImageCacheが最近更新された前提で軽く）
+    // 厳密に「直後」判定したい場合は lastImageCache.at を使ってもOK。
+    if (noLabels && !session.paid.labelsAskedAfterImage) {
+      // labelsAskedAfterImage は「一度でも促したら true」
+      // ここでは「画像を使ったターン」だけ促したいので、直前に pendingImage合流が起きた時は lastImageCache が更新されている。
+      // ただしユーザーが画像無しで進めても、促しは出ない。
+      const justHadImage = !!session.paid.lastImageCache && !!session.paid.lastImageCache.at;
+      if (justHadImage) {
+        session.paid.labelsAskedAfterImage = true;
+        finalReply += tidyLines(`
+        
+――
+ちなみに💋 呼び名セットするとスクショの精度が一気に上がる。
+任意でいいから、よかったらこれだけ送って♡
+
+相手→自分=（例：先輩）
+自分→相手=（例：Aちゃん）
+
+未設定でも進める。`);
+      }
+    }
+
+    // メモリ更新（あれば）
     try {
-      return await runPaidTurn(event, session, text, false);
-    } catch (e) {
-      console.error("PAID CHAT ERROR:", e?.status, e?.code, e?.message);
-      return replyText(event, "ごめん、今ちょっと詰まった。もう一回送って💋");
-    }
-  }
-
-  // 無料：自由入力
-  if (session.state === State.FREE_COLLECT) {
-    const updates = applyFreeNLU(text, session.answers);
-    Object.assign(session.answers, updates);
-
-    const q = nextMissingQuestion(session.answers);
-    if (q) {
-      return replyText(event, `${saraAck("ask")}\n${q}`);
+      if (detectImportantEvent && updatePaidSummaryIfNeeded) {
+        const importantEventHit = detectImportantEvent(text);
+        await updatePaidSummaryIfNeeded({
+          openai,
+          session,
+          userText: text,
+          aiText: aiReply,
+          importantEventHit,
+        });
+      }
+    } catch {
+      // noop
     }
 
-    session.state = State.FREE_ANALYSIS_DONE;
-    const analysis = buildFreeAnalysis(session.answers);
-    return replyText(event, analysis, ["▶ 続きを見る（有料）", "今日はここまで", "メニュー"]);
-  }
+    // スコア（CHATでは出さない方針を堅牢化）
+    try {
+      if (computePaidScore && formatPaidScoreForUser) {
+        const score = computePaidScore({
+          userText: text,
+          mode: session.paid.mode,
+          phase: session.paid.phase,
+          answers: session.answers,
+        });
 
-  // 開始前
-  if (session.state === State.IDLE) {
-    if (text === "既読無視") return startReadFlow(event, session);
-    return sendStartMenu(event);
-  }
-
-  // 無料分析後
-  if (session.state === State.FREE_ANALYSIS_DONE) {
-    if (text === "▶ 続きを見る（有料）") return handlePaywallContent(event, session);
-    if (text === "今日はここまで") {
-      resetSession(userId);
-      return replyText(event, "OK。\n今日はここまで。\nまた来なさい💋", ["メニュー"]);
+        if (score && score.enabled && !/CHAT/i.test(String(session.paid.mode || ""))) {
+          session.paid.lastScore = score;
+          finalReply += `\n\n――\n${formatPaidScoreForUser(score)}`;
+        } else {
+          session.paid.lastScore = null;
+        }
+      } else {
+        session.paid.lastScore = null;
+      }
+    } catch {
+      session.paid.lastScore = null;
     }
-    return replyText(event, "どっちにする？", ["▶ 続きを見る（有料）", "今日はここまで", "メニュー"]);
+
+    return replyText(event, finalReply);
   }
 
-  // 旧フロー保険
-  return handleReadFlow(event, session, text);
+  return replyText(event, "うまく読めなかったわ💋 もう一回。");
 }
 
 const PORT = process.env.PORT || 3000;

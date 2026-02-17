@@ -784,5 +784,7 @@ if (process.env.RUN_EVAL === "1") {
     process.exit(1);
   });
 } else {
-  console.log('RUN_EVAL=1 を付けて実行してね（例: PowerShell "$env:RUN_EVAL=\\"1\\"; $env:REPEAT=\\"3\\"; node eval_harness.js"）');
+  console.log('RUN_EVAL=1 を付けて実行してね（例: PowerShell "$env:RUN_EVAL="1"; $env:REPEAT="3"; node eval_harness.js"）');
 }
+
+
