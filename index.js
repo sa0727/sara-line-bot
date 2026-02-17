@@ -11,6 +11,10 @@ const { computePaidScore, formatPaidScoreForUser } = require("./paid_score");
 // ★画像解析（vision_ocr.js）
 const { analyzeImageToConsultText } = require("./vision_ocr");
 
+// ★Stripe（月額課金）
+// 事前に ./stripe_routes.js を用意してある前提（前の回答の内容）
+const { mountStripeRoutes, getUser, isActiveUserRow } = require("./stripe_routes");
+
 const app = express();
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -22,6 +26,18 @@ const config = {
 const client = new line.Client(config);
 
 const userStore = new Map();
+
+/**
+ * Stripe Webhook は raw body が必要
+ * - /stripe/checkout だけ JSON
+ * - /stripe/webhook だけ raw
+ * ※ line.middleware は独自に body を扱うので、app.use(express.json()) の全体適用は避ける
+ */
+app.jsonParser = express.json();
+app.rawParser = express.raw({ type: "application/json" });
+
+// Stripe routes（/stripe/checkout, /stripe/webhook, /billing/*）
+mountStripeRoutes(app);
 
 function freshSession() {
   return {
@@ -36,6 +52,9 @@ function freshSession() {
       // 画像解析用
       lastImage: null,
       pendingImage: null, // { messageId, at }
+
+      // 決済リンク連打抑止（任意）
+      checkoutIssuedAt: null,
     },
   };
 }
@@ -121,6 +140,7 @@ function dumpSession(session) {
       lastScore: session.paid?.lastScore || null,
       lastImage: session.paid?.lastImage || null,
       pendingImage: session.paid?.pendingImage || null,
+      checkoutIssuedAt: session.paid?.checkoutIssuedAt || null,
     },
   };
 }
@@ -216,10 +236,7 @@ function buildFreeLightAdvice(problem, goal) {
       "相手が返しやすい“軽い近況”から入る",
       "反応が薄いなら深追いしない（撤退も勝ち筋）",
     ];
-    templates = [
-      "「久しぶり。ふと思い出しただけ。元気にしてた？」",
-      "「近く通ったから思い出した。最近どう？」",
-    ];
+    templates = ["「久しぶり。ふと思い出しただけ。元気にしてた？」", "「近く通ったから思い出した。最近どう？」"];
     ngList = ["謝罪長文", "いきなり復縁要求", "過去の蒸し返し"];
   }
 
@@ -229,10 +246,7 @@ function buildFreeLightAdvice(problem, goal) {
       "相手の好意サイン（会話の濃さ/頻度/誘いへの反応）を1つ拾う",
       "次の接点（通話/一緒に遊ぶ/会う）を増やして温度を整える",
     ];
-    templates = [
-      "「今度、◯◯一緒にしよ。時間合う日ある？」",
-      "「最近話すの楽しい。もうちょい一緒にいたいな」",
-    ];
+    templates = ["「今度、◯◯一緒にしよ。時間合う日ある？」", "「最近話すの楽しい。もうちょい一緒にいたいな」"];
     ngList = ["雰囲気任せの突然告白", "返事を急かす", "重い覚悟語り"];
   }
 
@@ -242,10 +256,7 @@ function buildFreeLightAdvice(problem, goal) {
       "相手が返しやすい“軽い共有＋短い質問”で接点を作る",
       "相手の生活リズムに合わせて、無理に追わない",
     ];
-    templates = [
-      "「今日ちょっと笑った話ある。時間ある時に聞いてw」",
-      "「今度また一緒にやろ。次は◯◯試したい」",
-    ];
+    templates = ["「今日ちょっと笑った話ある。時間ある時に聞いてw」", "「今度また一緒にやろ。次は◯◯試したい」"];
     ngList = ["反応に一喜一憂して態度がブレる", "駆け引きで試す"];
   }
 
@@ -280,6 +291,22 @@ async function handleEvent(event) {
   if (!userId) return;
 
   const session = getSession(userId);
+
+  // --------------------------
+  // ★課金状態：DBが真実
+  // - Mapのstateより先にDBを見て、PAIDの可否を確定
+  // - DBが落ちてもFREEは動く（PAIDは安全側で閉じる）
+  // --------------------------
+  try {
+    const u = await getUser(userId);
+    if (isActiveUserRow(u)) {
+      session.state = "PAID_CHAT";
+    } else {
+      if (session.state === "PAID_CHAT") session.state = "PAID_GATE";
+    }
+  } catch (e) {
+    console.error("[PAID_CHECK] failed", e);
+  }
 
   // --------------------------
   // 画像メッセージ：即返信＋キュー保存（ここでは解析しない）
@@ -432,7 +459,7 @@ async function handleEvent(event) {
 
       session.answers.goal = pickMeaningfulLine(text);
 
-      // ✅ FREEの締め：軽い提案（案）を出してから、有料導線
+      // ✅ FREEの締め：軽い提案（案）を出してから、有料導線（= PAID_GATE）
       session.state = "PAID_GATE";
 
       const problem = session.answers.problem;
@@ -458,11 +485,68 @@ ${advice}
   }
 
   // --------------------------
-  // 有料ゲート
+  // 有料ゲート：Checkoutリンクを出す（PAID解放はWebhookで確定）
   // --------------------------
   if (session.state === "PAID_GATE" && isPaidButtonText(text)) {
-    session.state = "PAID_CHAT";
-    return replyText(event, buildPaidContent(session.answers));
+    // すでに課金済みなら即入れる（保険）
+    try {
+      const u = await getUser(userId);
+      if (isActiveUserRow(u)) {
+        session.state = "PAID_CHAT";
+        return replyText(event, buildPaidContent(session.answers));
+      }
+    } catch {}
+
+    // 連打でリンク大量発行を抑える（60秒）
+    if (session.paid.checkoutIssuedAt && Date.now() - session.paid.checkoutIssuedAt < 60 * 1000) {
+      return replyText(
+        event,
+        `いま決済リンク作ってる最中💋
+1分だけ待てる？
+（待てないならもう一回送ってもいいけど、リンクが増えるだけよ）`
+      );
+    }
+    session.paid.checkoutIssuedAt = Date.now();
+
+    // Checkout URL を作る：同一サーバの /stripe/checkout を叩く（最短実装）
+    const baseUrl = process.env.APP_BASE_URL;
+
+    try {
+      if (typeof fetch !== "function") {
+        throw new Error("fetch is not available. Use Node 18+ or install node-fetch.");
+      }
+
+      const r = await fetch(`${baseUrl}/stripe/checkout`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lineUserId: userId }),
+      });
+      const j = await r.json();
+
+      if (j.alreadyPaid) {
+        session.state = "PAID_CHAT";
+        return replyText(event, buildPaidContent(session.answers));
+      }
+
+      if (!j.url) throw new Error("missing checkout url");
+
+      return replyText(
+        event,
+        `ここからは設計モード💋
+月額¥980、縛りなし。いつでも解約できる。
+
+▶ 決済して続ける：${j.url}
+
+決済が完了したら、そのままLINEで続けな。`
+      );
+    } catch (e) {
+      console.error("[PAYWALL] checkout failed", e);
+      return replyText(
+        event,
+        `今、決済リンクの発行で詰まった💋
+もう一回「▶ 続きを見る（有料）」って送って。`
+      );
+    }
   }
 
   // --------------------------
