@@ -630,8 +630,6 @@ ${advice}
 
 const PORT = process.env.PORT || 3000;
 
-const { query } = require("./db");
-
 async function ensureTables() {
   try {
     await query(`
