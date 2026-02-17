@@ -1,3 +1,4 @@
+// index.js
 require("dotenv").config();
 const express = require("express");
 const line = require("@line/bot-sdk");
@@ -32,17 +33,6 @@ function freshSession() {
       history: [],
       lastScore: null,
 
-      // 呼び名（スクショ解釈の安定化）
-      // otherToUser: 相手が「あなた」を呼ぶ呼び名
-      // userToOther: あなたが「相手」を呼ぶ呼び名
-      labels: {
-        otherToUser: null,
-        userToOther: null,
-      },
-      flags: {
-        askedLabelsOnce: false,
-      },
-
       // 画像解析用
       lastImage: null,
       pendingImage: null, // { messageId, at }
@@ -62,6 +52,7 @@ function tidyLines(s) {
     .toString()
     .replace(/\r\n/g, "\n")
     .replace(/\r/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
@@ -81,84 +72,6 @@ function isPaidButtonText(text) {
     /続き.*有料/.test(t) ||
     (t.includes("▶") && t.includes("有料"))
   );
-}
-
-function normalizeArrow(s) {
-  return (s || "")
-    .replace(/→/g, "->")
-    .replace(/＞/g, ">")
-    .replace(/＝/g, "=")
-    .replace(/：/g, ":")
-    .trim();
-}
-
-/**
- * 呼び名入力を柔軟にパースする。
- * 受理例：
- * - 相手→あなた=先輩
- * - 相手->自分 は 先輩
- * - 自分→相手=りん
- * - あなた→相手: Aちゃん
- */
-function parseLabelSetup(text) {
-  const raw = normalizeArrow(text);
-  if (!raw) return null;
-
-  // まとめて書かれてるケースもあるので、行ごとに見る
-  const lines = raw
-    .split("\n")
-    .map((l) => l.trim())
-    .filter(Boolean);
-
-  const out = { otherToUser: null, userToOther: null };
-
-  const pickValue = (line) => {
-    const m = line.match(/(?:=|:|は)\s*(.+)$/);
-    return m ? m[1].trim() : null;
-  };
-
-  for (const line of lines) {
-    const l = line.replace(/\s+/g, " ");
-
-    // 相手 -> (あなた|自分)
-    if (/^相手\s*->\s*(あなた|自分)/.test(l)) {
-      out.otherToUser = pickValue(l);
-      continue;
-    }
-    if (/^(あなた|自分)\s*<-\s*相手/.test(l)) {
-      out.otherToUser = pickValue(l);
-      continue;
-    }
-
-    // (あなた|自分) -> 相手
-    if (/^(あなた|自分)\s*->\s*相手/.test(l)) {
-      out.userToOther = pickValue(l);
-      continue;
-    }
-    if (/^相手\s*<-\s*(あなた|自分)/.test(l)) {
-      out.userToOther = pickValue(l);
-      continue;
-    }
-  }
-
-  // 値が「未設定」系なら null 扱い
-  const clean = (v) => {
-    const t = (v || "").trim();
-    if (!t) return null;
-    if (/^(未設定|なし|ナシ|わからない|不明)$/i.test(t)) return null;
-    return t;
-  };
-
-  out.otherToUser = clean(out.otherToUser);
-  out.userToOther = clean(out.userToOther);
-
-  if (!out.otherToUser && !out.userToOther) return null;
-  return out;
-}
-
-function isAskToChangeLabels(text) {
-  const t = (text || "").trim();
-  return /呼び名(変更|セット|設定)/.test(t) || /ニックネーム(変更|設定)/.test(t);
 }
 
 // LINE画像を dataURL に変換
@@ -197,22 +110,6 @@ function shouldTriggerImageParse(text) {
   return true;
 }
 
-function isLikelyGreetingOrSmalltalk(text) {
-  const t = (text || "").trim();
-  if (!t) return true;
-  if (/^(こんにちは|こんばんは|おはよう|やあ|hey|hi|hello|はじめまして|よろしく)(！|。)?$/i.test(t)) return true;
-  if (t.length <= 2 && /^(うーん|んー|ん|？|\?)$/.test(t)) return true;
-  return false;
-}
-
-function isLikelyGoal(text) {
-  const t = (text || "").trim();
-  if (!t) return false;
-  if (/(告白|復縁|距離|仲直り|喧嘩|既読|未読|返信|デート|脈|好き|片思い|別れ)/.test(t)) return true;
-  if (/^(告白|復縁|距離縮めたい|距離を縮めたい|仲直り|返信|デート)$/.test(t)) return true;
-  return false;
-}
-
 function dumpSession(session) {
   return {
     state: session.state,
@@ -222,12 +119,148 @@ function dumpSession(session) {
       phase: session.paid?.phase,
       historyLen: session.paid?.history?.length || 0,
       lastScore: session.paid?.lastScore || null,
-      labels: session.paid?.labels || null,
-      flags: session.paid?.flags || null,
       lastImage: session.paid?.lastImage || null,
       pendingImage: session.paid?.pendingImage || null,
     },
   };
+}
+
+/**
+ * 無料で「挨拶/雑談っぽい入力」を恋愛に戻す
+ */
+function isSmallTalkLike(text) {
+  const t = (text || "").trim();
+  if (!t) return true;
+  if (/^(こんにちは|こんばんは|おはよ|おはよう|やあ|はじめまして|どうも|hi|hello)[！!。]*$/i.test(t))
+    return true;
+  if (/^(うーん|んー|うん|はい|ok|OK|了解|りょ|わかった|わかりました|なるほど)[。!！]*$/i.test(t))
+    return true;
+  return false;
+}
+
+/**
+ * 恋愛シグナルが薄い時に、恋愛の状況提示を促す
+ */
+function looksLikeRomance(text) {
+  const t = (text || "").trim();
+  if (!t) return false;
+  // ざっくりで良い。誤判定しても「恋の状況を1〜2行で」に戻すだけ。
+  return /(既読|未読|返信|LINE|連絡|告白|復縁|好き|気になる|彼氏|彼女|片思い|デート|会いたい|脈|距離|冷たい|別れ|元カレ|元カノ|付き合)/.test(
+    t
+  );
+}
+
+/**
+ * problem/goal に「わかった」「OK」みたいなノイズが混ざるのを防ぐ
+ * - 複数行なら「意味のある行」だけを拾う
+ */
+function pickMeaningfulLine(text) {
+  const lines = tidyLines(text).split("\n").map((x) => x.trim()).filter(Boolean);
+  if (lines.length === 0) return "";
+
+  const noise = /^(うん|はい|ok|OK|了解|りょ|わかった|わかりました|なるほど|そう|そうそう|よし|とりあえず|一旦|すみません|ごめん)[。!！]*$/i;
+  const meaningful = lines.filter((l) => !noise.test(l));
+
+  // 意味ある行があれば最後を採用（ユーザーが最後に本題を書きがち）
+  if (meaningful.length > 0) return meaningful[meaningful.length - 1];
+
+  // 全部ノイズっぽいなら、最後の行を返す（完全空は避ける）
+  return lines[lines.length - 1];
+}
+
+/**
+ * 無料体験：軽い提案（案）
+ * - 完成例文を量産しない
+ * - “方向性/次の一手候補/NG/雛形1〜2” だけ
+ */
+function buildFreeLightAdvice(problem, goal) {
+  const p = (problem || "").trim();
+  const g = (goal || "").trim();
+
+  // ざっくりカテゴリ
+  const isReadIgnored = /(既読無視|未読無視|既読スルー|未読スルー|返信ない|返ってこない)/.test(p);
+  const isReconcile = /(復縁|別れ|元カレ|元カノ)/.test(p) || /(復縁)/.test(g);
+  const isConfess = /(告白|付き合)/.test(g) || /(告白|付き合)/.test(p);
+  const isClose = /(距離|仲良く|近づ)/.test(g);
+
+  let direction = "まずは相手の温度と前提（関係性/距離感）を揃えるのが勝ち筋♡";
+  let doList = [
+    "相手の反応が分かる材料を集める（直近のやり取り／相手の言い回し／既読未読）",
+    "“返しやすい球”を1回だけ投げて様子見（質問は短く、重くしない）",
+  ];
+  let ngList = ["詰問（なんで返さないの？）", "長文連投／感情爆発／試す駆け引き"];
+
+  let templates = [
+    "「今ちょっとバタバタ？落ち着いたらでいいから、ひとことだけ返して〜🙂」",
+    "「これだけ聞きたいんだけど、今週って忙しい？」",
+  ];
+
+  if (isReadIgnored) {
+    direction = "既読無視は“追撃の質”で勝負が決まる。重くせず、返しやすく♡";
+    doList = [
+      "追撃は“1回だけ”にする（連投しない）",
+      "質問は Yes/No か短文で返せる形にする",
+      "24時間〜様子見して、相手の生活リズムを読む",
+    ];
+    templates = [
+      "「今って忙しい？落ち着いたらでいいから、ひとことだけ返して🙂」",
+      "「今日ふと思い出したんだけどさ、◯◯ってまだ好き？」",
+    ];
+    ngList = ["責める（なんで無視？）", "病む匂わせ／重い確認", "連投で圧をかける"];
+  }
+
+  if (isReconcile) {
+    direction = "復縁は“感情”より“再接続の空気作り”が先。焦ると負けるわ💋";
+    doList = [
+      "いきなり関係を戻そうとしない（まず雑談レベルで再接続）",
+      "相手が返しやすい“軽い近況”から入る",
+      "反応が薄いなら深追いしない（撤退も勝ち筋）",
+    ];
+    templates = [
+      "「久しぶり。ふと思い出しただけ。元気にしてた？」",
+      "「近く通ったから思い出した。最近どう？」",
+    ];
+    ngList = ["謝罪長文", "いきなり復縁要求", "過去の蒸し返し"];
+  }
+
+  if (isConfess) {
+    direction = "告白は“関係の土台”→“意思表示”の順。いきなり凸ると危ない♡";
+    doList = [
+      "相手の好意サイン（会話の濃さ/頻度/誘いへの反応）を1つ拾う",
+      "次の接点（通話/一緒に遊ぶ/会う）を増やして温度を整える",
+    ];
+    templates = [
+      "「今度、◯◯一緒にしよ。時間合う日ある？」",
+      "「最近話すの楽しい。もうちょい一緒にいたいな」",
+    ];
+    ngList = ["雰囲気任せの突然告白", "返事を急かす", "重い覚悟語り"];
+  }
+
+  if (isClose && !isConfess) {
+    direction = "距離を縮めるなら『頻度』より“安心感の一貫性”が強い♡";
+    doList = [
+      "相手が返しやすい“軽い共有＋短い質問”で接点を作る",
+      "相手の生活リズムに合わせて、無理に追わない",
+    ];
+    templates = [
+      "「今日ちょっと笑った話ある。時間ある時に聞いてw」",
+      "「今度また一緒にやろ。次は◯◯試したい」",
+    ];
+    ngList = ["反応に一喜一憂して態度がブレる", "駆け引きで試す"];
+  }
+
+  const advice = [
+    "【軽い提案（案）】",
+    `・方向性：${direction}`,
+    `・まずやること：${doList.map((x) => `\n  - ${x}`).join("")}`,
+    `・NG：${ngList.map((x) => `\n  - ${x}`).join("")}`,
+    "",
+    "【雛形（まだ“完成設計”じゃない）】💋",
+    `- ${templates[0]}`,
+    `- ${templates[1]}`,
+  ].join("\n");
+
+  return advice;
 }
 
 app.post("/webhook", line.middleware(config), async (req, res) => {
@@ -319,21 +352,10 @@ async function handleEvent(event) {
     try {
       const dataUrl = await fetchLineImageAsDataUrl(pending.messageId);
 
-      // 呼び名ヒントを注入（左右の発言者も明示）
-      const labelHintParts = [
-        "LINEトークスクショ。右側=相談者（あなた）、左側=相手。",
-      ];
-      if (session.paid?.labels?.otherToUser) {
-        labelHintParts.push(`相手があなたを呼ぶ呼び名: ${session.paid.labels.otherToUser}`);
-      }
-      if (session.paid?.labels?.userToOther) {
-        labelHintParts.push(`あなたが相手を呼ぶ呼び名: ${session.paid.labels.userToOther}`);
-      }
-
       const vision = await analyzeImageToConsultText({
         openai,
         dataUrl,
-        hintText: labelHintParts.join("\n"),
+        hintText: "LINEのトークスクショ。恋愛相談として必要な要点を抜き出して。",
       });
 
       session.paid.lastImage = {
@@ -358,32 +380,30 @@ async function handleEvent(event) {
       console.error("[IMAGE] analyze failed:", e);
       return replyText(
         event,
-        `画像は受け取った。
-でも今ちょっと読み取りに失敗したわ💋
-
-スクショの内容を、テキストで1〜3行で貼って。どこが気になる？`
+        `画像は受け取った。\nでも今ちょっと読み取りに失敗したわ💋\n\nスクショの内容を、テキストで1〜3行で貼って。どこが気になる？`
       );
     }
   }
 
   // --------------------------
-  // 無料フェーズ
+  // 無料フェーズ（雑談を恋愛に戻す＋軽い提案を必ず出す）
   // --------------------------
   if (session.state === "FREE") {
-    // 雑談/挨拶で進めない（恋愛相談に戻す）
-    if (isLikelyGreetingOrSmalltalk(text)) {
-      return replyText(
-        event,
-        `ここは恋愛の話だけね💋
+    // 1) まだ problem がない時：雑談なら恋愛に戻す
+    if (!session.answers.problem) {
+      // 雑談 or 恋愛シグナル薄い → 恋愛状況を要求
+      if (isSmallTalkLike(text) || !looksLikeRomance(text)) {
+        return replyText(
+          event,
+          `ここは恋愛の話だけね💋
 挨拶は受け取った。
 
 いまの恋の状況を1〜2行で。
 （例：オンラインの子が気になる／既読無視／復縁したい など）`
-      );
-    }
+        );
+      }
 
-    if (!session.answers.problem) {
-      session.answers.problem = text;
+      session.answers.problem = pickMeaningfulLine(text);
       return replyText(
         event,
         `うん。
@@ -391,26 +411,42 @@ async function handleEvent(event) {
       );
     }
 
+    // 2) goal 未設定
     if (!session.answers.goal) {
-      if (!isLikelyGoal(text)) {
+      // goalっぽくない/迷い → 代表例を出して聞き直す
+      if (isSmallTalkLike(text) || text.length <= 1) {
         return replyText(
           event,
-          `目的がまだぼんやりね💋
-いま一番したいことを、ひとつ選んで。
+          `目的を決めるわ💋
+いま一番したいことはどれ？
 
-・告白
-・復縁
 ・距離を縮めたい
-・返信を考えたい
-・仲直りしたい`
+・既読無視を解決したい
+・告白したい
+・復縁したい
+・仲直りしたい
+
+この中で一番近いのを1つでいい。`
         );
       }
-      session.answers.goal = text;
+
+      session.answers.goal = pickMeaningfulLine(text);
+
+      // ✅ FREEの締め：軽い提案（案）を出してから、有料導線
       session.state = "PAID_GATE";
+
+      const problem = session.answers.problem;
+      const goal = session.answers.goal;
+      const advice = buildFreeLightAdvice(problem, goal);
+
       return replyText(
         event,
         `状況は整理できたわ💋
-焦らないで進めるのが大事。
+
+・いまの状況：${problem}
+・狙い：${goal}
+
+${advice}
 
 ――
 ここから先は“設計”になる。
@@ -426,61 +462,18 @@ async function handleEvent(event) {
   // --------------------------
   if (session.state === "PAID_GATE" && isPaidButtonText(text)) {
     session.state = "PAID_CHAT";
-    // 呼び名ヒアリングは最初に1回だけ表示（未設定の場合）
-    if (session.paid?.flags) session.paid.flags.askedLabelsOnce = true;
-    return replyText(event, buildPaidContent(session.answers, session.paid));
+    return replyText(event, buildPaidContent(session.answers));
   }
 
   // --------------------------
   // 有料チャット
   // --------------------------
   if (session.state === "PAID_CHAT") {
-    // 呼び名変更/セット要求
-    if (isAskToChangeLabels(text)) {
-      session.paid.flags.askedLabelsOnce = true;
-      return replyText(
-        event,
-        `呼び名セットいくわよ💋
-次の形で送って。
-
-相手→あなた=（相手があなたを呼ぶ呼び名）
-あなた→相手=（あなたが相手を呼ぶ呼び名）
-
-例：
-相手→あなた=先輩
-あなた→相手=りん
-
-未設定なら「未設定」でOK。`
-      );
-    }
-
-    // 呼び名の入力っぽいテキストはここで確実に拾って保存
-    const parsedLabels = parseLabelSetup(text);
-    if (parsedLabels) {
-      session.paid.labels.otherToUser = parsedLabels.otherToUser ?? session.paid.labels.otherToUser;
-      session.paid.labels.userToOther = parsedLabels.userToOther ?? session.paid.labels.userToOther;
-      session.paid.flags.askedLabelsOnce = true;
-
-      const otherToUser = session.paid.labels.otherToUser || "（未設定）";
-      const userToOther = session.paid.labels.userToOther || "（未設定）";
-      return replyText(
-        event,
-        `了解💋 呼び名はこうね。
-
-相手→あなた = ${otherToUser}
-あなた→相手 = ${userToOther}
-
-この前提でスクショも会話も読む。続けて。`
-      );
-    }
-
     const aiReply = await generatePaidChatSara({
       openai,
       answers: session.answers,
       history: session.paid.history,
       userText: text,
-      labels: session.paid.labels,
-      lastImage: session.paid.lastImage,
     });
 
     session.paid.history.push({ role: "user", content: text });
@@ -503,9 +496,6 @@ async function handleEvent(event) {
     } else {
       session.paid.lastScore = null;
     }
-
-    // lastImage は1ターン限定（次の発話に引きずらない）
-    session.paid.lastImage = null;
 
     return replyText(event, finalReply);
   }
