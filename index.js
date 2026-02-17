@@ -51,12 +51,13 @@ async function ensureTables() {
       );
     `);
 
-    console.log("✅ Tables ensured");
+    console.log("✅ ensureTables OK (users/payments/processed_events)");
   } catch (e) {
-    console.error("❌ Table creation failed:", e);
+    console.error("❌ ensureTables failed:", e);
   }
 }
 
+// ★ app.listen より前で必ず呼ぶ
 ensureTables();
 
 const config = {
