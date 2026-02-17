@@ -18,6 +18,47 @@ const { mountStripeRoutes, getUser, isActiveUserRow } = require("./stripe_routes
 const app = express();
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+const { query } = require("./db");
+
+async function ensureTables() {
+  try {
+    await query(`
+      create table if not exists users (
+        line_user_id text primary key,
+        stripe_customer_id text,
+        stripe_subscription_id text,
+        subscription_status text not null default 'inactive',
+        current_period_end timestamptz,
+        paid_until timestamptz,
+        updated_at timestamptz not null default now()
+      );
+    `);
+
+    await query(`
+      create table if not exists payments (
+        checkout_session_id text primary key,
+        line_user_id text not null,
+        stripe_subscription_id text,
+        status text not null,
+        created_at timestamptz not null default now()
+      );
+    `);
+
+    await query(`
+      create table if not exists processed_events (
+        event_id text primary key,
+        processed_at timestamptz not null default now()
+      );
+    `);
+
+    console.log("✅ Tables ensured");
+  } catch (e) {
+    console.error("❌ Table creation failed:", e);
+  }
+}
+
+ensureTables();
+
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
