@@ -588,6 +588,30 @@ ${advice}
 }
 
 const PORT = process.env.PORT || 3000;
+
+const { query } = require("./db");
+
+async function ensureTables() {
+  try {
+    await query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        line_user_id TEXT UNIQUE NOT NULL,
+        stripe_customer_id TEXT,
+        subscription_id TEXT,
+        subscription_status TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+
+    console.log("✅ users table ensured");
+  } catch (err) {
+    console.error("❌ table creation error:", err);
+  }
+}
+
+ensureTables();
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
