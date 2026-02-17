@@ -18,7 +18,8 @@ function toLowerSafe(s) {
 function toId(maybeIdOrObj) {
   if (!maybeIdOrObj) return null;
   if (typeof maybeIdOrObj === "string") return maybeIdOrObj;
-  if (typeof maybeIdOrObj === "object" && typeof maybeIdOrObj.id === "string") return maybeIdOrObj.id;
+  if (typeof maybeIdOrObj === "object" && typeof maybeIdOrObj.id === "string")
+    return maybeIdOrObj.id;
   return null;
 }
 
@@ -31,7 +32,9 @@ function isActiveUserRow(row) {
 }
 
 async function getUser(lineUserId) {
-  const r = await query(`select * from users where line_user_id=$1 limit 1`, [lineUserId]);
+  const r = await query(`select * from users where line_user_id=$1 limit 1`, [
+    lineUserId,
+  ]);
   return r.rows[0] || null;
 }
 
@@ -42,7 +45,9 @@ async function upsertUserPaid({
   status,
   currentPeriodEndUnix, // seconds
 }) {
-  const paidUntil = currentPeriodEndUnix ? new Date(currentPeriodEndUnix * 1000) : null;
+  const paidUntil = currentPeriodEndUnix
+    ? new Date(currentPeriodEndUnix * 1000)
+    : null;
 
   await query(
     `
@@ -77,7 +82,10 @@ async function upsertUserPaid({
 
 async function markUserUnpaidBySubscription(subId, status) {
   // subIdからユーザー特定して落とす
-  const r = await query(`select line_user_id from users where stripe_subscription_id=$1 limit 1`, [subId]);
+  const r = await query(
+    `select line_user_id from users where stripe_subscription_id=$1 limit 1`,
+    [subId]
+  );
   const row = r.rows[0];
   if (!row) return;
 
@@ -95,7 +103,9 @@ async function markUserUnpaidBySubscription(subId, status) {
 }
 
 async function alreadyProcessed(eventId) {
-  const r = await query(`select 1 from processed_events where event_id=$1`, [eventId]);
+  const r = await query(`select 1 from processed_events where event_id=$1`, [
+    eventId,
+  ]);
   return r.rowCount > 0;
 }
 
@@ -111,7 +121,10 @@ function mountStripeRoutes(app) {
   app.post("/stripe/checkout", app.jsonParser, async (req, res) => {
     try {
       const { lineUserId } = req.body || {};
-      if (!lineUserId) return res.status(400).json({ ok: false, error: "missing_lineUserId" });
+      if (!lineUserId)
+        return res
+          .status(400)
+          .json({ ok: false, error: "missing_lineUserId" });
 
       const existing = await getUser(lineUserId);
       if (isActiveUserRow(existing)) {
@@ -120,8 +133,10 @@ function mountStripeRoutes(app) {
 
       const baseUrl = process.env.APP_BASE_URL; // https://sara-line-bot.onrender.com
       const priceId = process.env.STRIPE_PRICE_ID; // ¥980/月のPrice ID
-      if (!baseUrl) return res.status(500).json({ ok: false, error: "missing_APP_BASE_URL" });
-      if (!priceId) return res.status(500).json({ ok: false, error: "missing_STRIPE_PRICE_ID" });
+      if (!baseUrl)
+        return res.status(500).json({ ok: false, error: "missing_APP_BASE_URL" });
+      if (!priceId)
+        return res.status(500).json({ ok: false, error: "missing_STRIPE_PRICE_ID" });
 
       const session = await stripe.checkout.sessions.create({
         mode: "subscription",
@@ -145,8 +160,28 @@ function mountStripeRoutes(app) {
 
       return res.json({ ok: true, url: session.url, checkoutSessionId: session.id });
     } catch (e) {
-      console.error("[stripe/checkout] error", e);
-      return res.status(500).json({ ok: false, error: "checkout_failed" });
+      // ★詳細ログ（原因特定用）
+      console.error("[stripe/checkout] error message:", e?.message);
+      console.error("[stripe/checkout] error code:", e?.code);
+      console.error("[stripe/checkout] error detail:", e?.detail);
+      console.error("[stripe/checkout] error table:", e?.table);
+      console.error("[stripe/checkout] error schema:", e?.schema);
+      console.error("[stripe/checkout] error routine:", e?.routine);
+      console.error("[stripe/checkout] error stack:", e?.stack);
+
+      // ★一時的にデバッグ情報を返す（原因が取れたら戻してOK）
+      return res.status(500).json({
+        ok: false,
+        error: "checkout_failed",
+        debug: {
+          message: e?.message,
+          code: e?.code,
+          detail: e?.detail,
+          table: e?.table,
+          schema: e?.schema,
+          routine: e?.routine,
+        },
+      });
     }
   });
 
@@ -155,7 +190,11 @@ function mountStripeRoutes(app) {
     let event;
     try {
       const sig = req.headers["stripe-signature"];
-      event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        sig,
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
     } catch (err) {
       console.error("[stripe/webhook] signature verify failed", err.message);
       return res.status(400).send(`Webhook Error: ${err.message}`);
@@ -170,7 +209,8 @@ function mountStripeRoutes(app) {
         case "checkout.session.completed": {
           const session = event.data.object;
 
-          const lineUserId = session.client_reference_id || session.metadata?.lineUserId;
+          const lineUserId =
+            session.client_reference_id || session.metadata?.lineUserId;
           if (!lineUserId) break;
 
           const subId = toId(session.subscription);
@@ -255,7 +295,9 @@ function mountStripeRoutes(app) {
   app.get("/billing/cancel", (req, res) => {
     res
       .status(200)
-      .send("キャンセルOK💋 続けたいならLINEで『▶ 続きを見る（有料）』って送って。");
+      .send(
+        "キャンセルOK💋 続けたいならLINEで『▶ 続きを見る（有料）』って送って。"
+      );
   });
 }
 
