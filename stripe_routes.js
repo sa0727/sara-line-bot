@@ -126,7 +126,16 @@ function mountStripeRoutes(app) {
       if (!priceId) return res.status(500).json({ ok: false, error: "missing_STRIPE_PRICE_ID" });
 
       const price = await stripe.prices.retrieve(priceId);
-      console.log("✅ PRICE LOOKUP", { id: price.id, livemode: price.livemode, active: price.active, product: price.product });
+console.log("✅ PRICE LOOKUP", {
+  id: price.id,
+  livemode: price.livemode,
+  active: price.active,
+  currency: price.currency,
+  unit_amount: price.unit_amount,
+  recurring: price.recurring ? { interval: price.recurring.interval } : null,
+  product: typeof price.product === "string" ? price.product : price.product?.id,
+});
+
 
 
       const session = await stripe.checkout.sessions.create({
