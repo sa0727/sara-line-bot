@@ -125,6 +125,10 @@ function mountStripeRoutes(app) {
       if (!baseUrl) return res.status(500).json({ ok: false, error: "missing_APP_BASE_URL" });
       if (!priceId) return res.status(500).json({ ok: false, error: "missing_STRIPE_PRICE_ID" });
 
+      const price = await stripe.prices.retrieve(priceId);
+      console.log("✅ PRICE LOOKUP", { id: price.id, livemode: price.livemode, active: price.active, product: price.product });
+
+
       const session = await stripe.checkout.sessions.create({
         mode: "subscription",
         line_items: [{ price: priceId, quantity: 1 }],
