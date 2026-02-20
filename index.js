@@ -302,10 +302,16 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 });
 
 async function handleEvent(event) {
-  if (event.type !== "message") return;
+  if (!event || event.type !== "message") return null;
 
   const userId = event.source?.userId;
-  if (!userId) return;
+
+  console.log("===== LINE EVENT DEBUG =====");
+  console.log("LINE USER ID:", userId);
+  console.log("EVENT TYPE:", event.type);
+  console.log("============================");
+
+  if (!userId) return null;
 
   const session = getSession(userId);
 
