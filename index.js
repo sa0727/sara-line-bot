@@ -339,14 +339,18 @@ app.post(
     next();
   },
   line.middleware(config),
-  async (req, res) => {
-    try {
-      await Promise.all((req.body.events || []).map(handleEvent));
-      return res.status(200).end();
-    } catch (err) {
-      console.error("webhook handler error", err);
-      return res.status(200).end();
-    }
+  (req, res) => {
+    // ✅ 先に200を返す（超重要）
+    res.status(200).end();
+
+    // ✅ あとで非同期処理
+    Promise.all((req.body.events || []).map(handleEvent))
+      .then(() => {
+        console.log("✅ webhook async complete");
+      })
+      .catch((err) => {
+        console.error("❌ webhook async error:", err);
+      });
   }
 );
 
