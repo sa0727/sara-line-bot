@@ -19,6 +19,26 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const { query } = require("./db");
 
+/**
+ * ✅ Health check（署名不要で「サーバ生存」確認）
+ * - Render / Uptime / 手動テスト用
+ */
+app.get("/health", (req, res) => {
+  res.status(200).json({ ok: true, at: new Date().toISOString() });
+});
+
+/**
+ * Stripe Webhook は raw body が必要
+ * - /stripe/checkout だけ JSON
+ * - /stripe/webhook だけ raw
+ * ※ line.middleware は独自に body を扱うので、app.use(express.json()) の全体適用は避ける
+ */
+app.jsonParser = express.json();
+app.rawParser = express.raw({ type: "application/json" });
+
+// Stripe routes（/stripe/checkout, /stripe/webhook, /billing/*）
+mountStripeRoutes(app);
+
 // ★DBテーブル自動作成（app.listenより前で1回だけ）
 async function ensureTables() {
   try {
@@ -56,6 +76,8 @@ async function ensureTables() {
     console.error("❌ ensureTables failed:", e);
   }
 }
+
+// ★listen前で必ず呼ぶ（awaitしない：起動ブロックしない）
 ensureTables();
 
 const config = {
@@ -66,18 +88,6 @@ const config = {
 const client = new line.Client(config);
 
 const userStore = new Map();
-
-/**
- * Stripe Webhook は raw body が必要
- * - /stripe/checkout だけ JSON
- * - /stripe/webhook だけ raw
- * ※ line.middleware は独自に body を扱うので、app.use(express.json()) の全体適用は避ける
- */
-app.jsonParser = express.json();
-app.rawParser = express.raw({ type: "application/json" });
-
-// Stripe routes（/stripe/checkout, /stripe/webhook, /billing/*）
-mountStripeRoutes(app);
 
 function freshSession() {
   return {
@@ -186,9 +196,17 @@ function dumpSession(session) {
 function isSmallTalkLike(text) {
   const t = (text || "").trim();
   if (!t) return true;
-  if (/^(こんにちは|こんばんは|おはよ|おはよう|やあ|はじめまして|どうも|hi|hello)[！!。]*$/i.test(t))
+  if (
+    /^(こんにちは|こんばんは|おはよ|おはよう|やあ|はじめまして|どうも|hi|hello)[！!。]*$/i.test(
+      t
+    )
+  )
     return true;
-  if (/^(うーん|んー|うん|はい|ok|OK|了解|りょ|わかった|わかりました|なるほど)[。!！]*$/i.test(t))
+  if (
+    /^(うーん|んー|うん|はい|ok|OK|了解|りょ|わかった|わかりました|なるほど)[。!！]*$/i.test(
+      t
+    )
+  )
     return true;
   return false;
 }
@@ -202,7 +220,10 @@ function looksLikeRomance(text) {
 }
 
 function pickMeaningfulLine(text) {
-  const lines = tidyLines(text).split("\n").map((x) => x.trim()).filter(Boolean);
+  const lines = tidyLines(text)
+    .split("\n")
+    .map((x) => x.trim())
+    .filter(Boolean);
   if (lines.length === 0) return "";
 
   const noise =
@@ -213,6 +234,11 @@ function pickMeaningfulLine(text) {
   return lines[lines.length - 1];
 }
 
+/**
+ * 無料体験：軽い提案（案）
+ * - 完成例文を量産しない
+ * - “方向性/次の一手候補/NG/雛形1〜2” だけ
+ */
 function buildFreeLightAdvice(problem, goal) {
   const p = (problem || "").trim();
   const g = (goal || "").trim();
@@ -255,7 +281,10 @@ function buildFreeLightAdvice(problem, goal) {
       "相手が返しやすい“軽い近況”から入る",
       "反応が薄いなら深追いしない（撤退も勝ち筋）",
     ];
-    templates = ["「久しぶり。ふと思い出しただけ。元気にしてた？」", "「近く通ったから思い出した。最近どう？」"];
+    templates = [
+      "「久しぶり。ふと思い出しただけ。元気にしてた？」",
+      "「近く通ったから思い出した。最近どう？」",
+    ];
     ngList = ["謝罪長文", "いきなり復縁要求", "過去の蒸し返し"];
   }
 
@@ -265,7 +294,10 @@ function buildFreeLightAdvice(problem, goal) {
       "相手の好意サイン（会話の濃さ/頻度/誘いへの反応）を1つ拾う",
       "次の接点（通話/一緒に遊ぶ/会う）を増やして温度を整える",
     ];
-    templates = ["「今度、◯◯一緒にしよ。時間合う日ある？」", "「最近話すの楽しい。もうちょい一緒にいたいな」"];
+    templates = [
+      "「今度、◯◯一緒にしよ。時間合う日ある？」",
+      "「最近話すの楽しい。もうちょい一緒にいたいな」",
+    ];
     ngList = ["雰囲気任せの突然告白", "返事を急かす", "重い覚悟語り"];
   }
 
@@ -275,7 +307,10 @@ function buildFreeLightAdvice(problem, goal) {
       "相手が返しやすい“軽い共有＋短い質問”で接点を作る",
       "相手の生活リズムに合わせて、無理に追わない",
     ];
-    templates = ["「今日ちょっと笑った話ある。時間ある時に聞いてw」", "「今度また一緒にやろ。次は◯◯試したい」"];
+    templates = [
+      "「今日ちょっと笑った話ある。時間ある時に聞いてw」",
+      "「今度また一緒にやろ。次は◯◯試したい」",
+    ];
     ngList = ["反応に一喜一憂して態度がブレる", "駆け引きで試す"];
   }
 
@@ -291,15 +326,29 @@ function buildFreeLightAdvice(problem, goal) {
   ].join("\n");
 }
 
-app.post("/webhook", line.middleware(config), async (req, res) => {
-  try {
-    await Promise.all((req.body.events || []).map(handleEvent));
-    res.status(200).end();
-  } catch (err) {
-    console.error("webhook error", err);
-    res.status(200).end();
+/**
+ * ✅ /webhook
+ * - line.middleware より前にロガーを入れる（到達可視化）
+ * - 署名がない手動POSTはここで分かる
+ */
+app.post(
+  "/webhook",
+  (req, res, next) => {
+    console.log("🔥 /webhook HIT", new Date().toISOString());
+    console.log("has x-line-signature:", !!req.headers["x-line-signature"]);
+    next();
+  },
+  line.middleware(config),
+  async (req, res) => {
+    try {
+      await Promise.all((req.body.events || []).map(handleEvent));
+      return res.status(200).end();
+    } catch (err) {
+      console.error("webhook handler error", err);
+      return res.status(200).end();
+    }
   }
-});
+);
 
 async function handleEvent(event) {
   if (!event || event.type !== "message") return null;
@@ -350,14 +399,20 @@ async function handleEvent(event) {
     }
   }
 
-  if (event.message?.type !== "text") return;
+  // テキスト以外（スタンプ等）は無視
+  if (event.message?.type !== "text") return null;
 
   let text = (event.message.text || "").trim();
 
+  // #dump
   if (text === "#dump") {
-    return replyText(event, "```json\n" + JSON.stringify(dumpSession(session), null, 2) + "\n```");
+    return replyText(
+      event,
+      "```json\n" + JSON.stringify(dumpSession(session), null, 2) + "\n```"
+    );
   }
 
+  // リセット
   if (text === "リセット") {
     userStore.delete(userId);
     return replyText(
@@ -368,6 +423,7 @@ async function handleEvent(event) {
     );
   }
 
+  // 🔴 スクショ送付確認は即レス（AI呼ばない）
   if (isScreenshotPermissionText(text)) {
     return replyText(
       event,
@@ -377,6 +433,7 @@ async function handleEvent(event) {
     );
   }
 
+  // ★pendingImage があれば、先に解析してテキスト合流
   if (session?.paid?.pendingImage && shouldTriggerImageParse(text)) {
     const pending = session.paid.pendingImage;
     session.paid.pendingImage = null;
@@ -394,15 +451,21 @@ async function handleEvent(event) {
         kind: vision.kind,
         summary: vision.summary || null,
         userIntent: vision.userIntent || null,
-        extractedLinesCount: Array.isArray(vision.extractedLines) ? vision.extractedLines.length : 0,
-        missingQuestions: Array.isArray(vision.missingQuestions) ? vision.missingQuestions : [],
+        extractedLinesCount: Array.isArray(vision.extractedLines)
+          ? vision.extractedLines.length
+          : 0,
+        missingQuestions: Array.isArray(vision.missingQuestions)
+          ? vision.missingQuestions
+          : [],
         at: new Date().toISOString(),
       };
 
       const synthetic =
         vision.suggestedUserText ||
         tidyLines(
-          `（トークスクショ要約）\n${vision.summary || "要約が取れなかった"}\n\n相談：この状況で次の一手を考えて。`
+          `（トークスクショ要約）\n${
+            vision.summary || "要約が取れなかった"
+          }\n\n相談：この状況で次の一手を考えて。`
         );
 
       text = tidyLines(`${synthetic}\n\n（補足）${text}`);
@@ -410,13 +473,19 @@ async function handleEvent(event) {
       console.error("[IMAGE] analyze failed:", e);
       return replyText(
         event,
-        `画像は受け取った。\nでも今ちょっと読み取りに失敗したわ💋\n\nスクショの内容を、テキストで1〜3行で貼って。どこが気になる？`
+        `画像は受け取った。
+でも今ちょっと読み取りに失敗したわ💋
+
+スクショの内容を、テキストで1〜3行で貼って。どこが気になる？`
       );
     }
   }
 
-  // 無料フェーズ
+  // --------------------------
+  // 無料フェーズ（雑談を恋愛に戻す＋軽い提案を必ず出す）
+  // --------------------------
   if (session.state === "FREE") {
+    // 1) まだ problem がない時：雑談なら恋愛に戻す
     if (!session.answers.problem) {
       if (isSmallTalkLike(text) || !looksLikeRomance(text)) {
         return replyText(
@@ -430,9 +499,14 @@ async function handleEvent(event) {
       }
 
       session.answers.problem = pickMeaningfulLine(text);
-      return replyText(event, `うん。\nいま一番したいことは？（告白/復縁/距離縮めたい など）`);
+      return replyText(
+        event,
+        `うん。
+いま一番したいことは？（告白/復縁/距離縮めたい など）`
+      );
     }
 
+    // 2) goal 未設定
     if (!session.answers.goal) {
       if (isSmallTalkLike(text) || text.length <= 1) {
         return replyText(
@@ -451,6 +525,8 @@ async function handleEvent(event) {
       }
 
       session.answers.goal = pickMeaningfulLine(text);
+
+      // ✅ FREEの締め：軽い提案（案）を出してから、有料導線（= PAID_GATE）
       session.state = "PAID_GATE";
 
       const advice = buildFreeLightAdvice(session.answers.problem, session.answers.goal);
@@ -473,8 +549,11 @@ ${advice}
     }
   }
 
-  // 有料ゲート
+  // --------------------------
+  // 有料ゲート：Checkoutリンクを出す（PAID解放はWebhookで確定）
+  // --------------------------
   if (session.state === "PAID_GATE" && isPaidButtonText(text)) {
+    // すでに課金済みなら即入れる（保険）
     try {
       const u = await getUser(userId);
       if (isActiveUserRow(u)) {
@@ -483,7 +562,11 @@ ${advice}
       }
     } catch {}
 
-    if (session.paid.checkoutIssuedAt && Date.now() - session.paid.checkoutIssuedAt < 60 * 1000) {
+    // 連打でリンク大量発行を抑える（60秒）
+    if (
+      session.paid.checkoutIssuedAt &&
+      Date.now() - session.paid.checkoutIssuedAt < 60 * 1000
+    ) {
       return replyText(
         event,
         `いま決済リンク作ってる最中💋
@@ -525,11 +608,17 @@ ${advice}
       );
     } catch (e) {
       console.error("[PAYWALL] checkout failed", e);
-      return replyText(event, `今、決済リンクの発行で詰まった💋\nもう一回「▶ 続きを見る（有料）」って送って。`);
+      return replyText(
+        event,
+        `今、決済リンクの発行で詰まった💋
+もう一回「▶ 続きを見る（有料）」って送って。`
+      );
     }
   }
 
+  // --------------------------
   // 有料チャット
+  // --------------------------
   if (session.state === "PAID_CHAT") {
     const aiReply = await generatePaidChatSara({
       openai,
@@ -550,6 +639,7 @@ ${advice}
 
     let finalReply = aiReply;
 
+    // mode=CHAT は保存もしない（paid_score.js 側でも弾くが保険）
     if (score && score.enabled && !/CHAT/i.test(String(session.paid.mode || ""))) {
       session.paid.lastScore = score;
       finalReply += `\n\n――\n${formatPaidScoreForUser(score)}`;
@@ -564,6 +654,16 @@ ${advice}
 }
 
 const PORT = process.env.PORT || 3000;
+
+/**
+ * ✅ Express エラーハンドラ
+ * - line.middleware 署名エラー等をログに出して 500 を潰す
+ * ※ ルート定義の後・listen の前に置く
+ */
+app.use((err, req, res, next) => {
+  console.error("❌ express error:", err);
+  res.status(400).send("bad request");
+});
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
