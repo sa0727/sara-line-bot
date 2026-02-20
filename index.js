@@ -127,10 +127,22 @@ function tidyLines(s) {
 }
 
 async function replyText(event, text) {
-  return client.replyMessage(event.replyToken, {
-    type: "text",
-    text: tidyLines(text),
-  });
+  const msg = { type: "text", text: tidyLines(text) };
+  try {
+    return await client.replyMessage(event.replyToken, msg);
+  } catch (e) {
+    console.error("❌ replyMessage failed:", e?.message || e);
+
+    // replyTokenが死んでたら push で救済
+    const userId = event?.source?.userId;
+    if (userId) {
+      try {
+        return await client.pushMessage(userId, msg);
+      } catch (e2) {
+        console.error("❌ pushMessage failed:", e2?.message || e2);
+      }
+    }
+  }
 }
 
 async function replyMessages(event, messages) {
