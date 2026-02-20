@@ -133,14 +133,50 @@ async function replyText(event, text) {
   });
 }
 
-function isPaidButtonText(text) {
-  const t = (text || "").trim();
-  return (
-    t === "▶ 続きを見る（有料）" ||
-    t === "続きを見る（有料）" ||
-    /続き.*有料/.test(t) ||
-    (t.includes("▶") && t.includes("有料"))
+async function replyMessages(event, messages) {
+  // messages: [{type:"text", text:"..."}, {type:"template", ...}]
+  return client.replyMessage(
+    event.replyToken,
+    (messages || []).map((m) => {
+      if (m.type === "text") return { type: "text", text: tidyLines(m.text) };
+      return m;
+    })
   );
+}
+
+async function replyPayButton(event, checkoutUrl) {
+  return client.replyMessage(event.replyToken, {
+    type: "template",
+    altText: "有料プランの決済はこちら",
+    template: {
+      type: "buttons",
+      title: "サラ（有料）へ進む💋",
+      text: "月額¥980／縛りなし。決済後すぐ続きができる。",
+      actions: [
+        { type: "uri", label: "決済して続きを見る", uri: checkoutUrl },
+        { type: "message", label: "やめる（無料に戻る）", text: "やめる" },
+      ],
+    },
+  });
+}
+
+// 内部：Checkout URL を発行
+async function issueCheckoutUrl(lineUserId) {
+  const baseUrl = process.env.APP_BASE_URL;
+  if (!baseUrl) throw new Error("APP_BASE_URL is not set");
+
+  if (typeof fetch !== "function") {
+    throw new Error("fetch is not available. Use Node 18+ or install node-fetch.");
+  }
+
+  const r = await fetch(`${baseUrl}/stripe/checkout`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ lineUserId }),
+  });
+
+  const j = await r.json();
+  return j;
 }
 
 // LINE画像を dataURL に変換
@@ -330,6 +366,8 @@ function buildFreeLightAdvice(problem, goal) {
  * ✅ /webhook
  * - line.middleware より前にロガーを入れる（到達可視化）
  * - 署名がない手動POSTはここで分かる
+ *
+ * ✅ 先に 200 を返して LINE のタイムアウトを避ける
  */
 app.post(
   "/webhook",
@@ -340,10 +378,10 @@ app.post(
   },
   line.middleware(config),
   (req, res) => {
-    // ✅ 先に200を返す（超重要）
+    // ✅ 先に200返す（重要）
     res.status(200).end();
 
-    // ✅ あとで非同期処理
+    // ✅ あとで非同期処理（落ちてもLINEはOK）
     Promise.all((req.body.events || []).map(handleEvent))
       .then(() => {
         console.log("✅ webhook async complete");
@@ -368,7 +406,7 @@ async function handleEvent(event) {
 
   const session = getSession(userId);
 
-  // ★課金状態：DBが真実
+  // ★課金状態：DBが真実（保険）
   try {
     const u = await getUser(userId);
     if (isActiveUserRow(u)) {
@@ -410,10 +448,7 @@ async function handleEvent(event) {
 
   // #dump
   if (text === "#dump") {
-    return replyText(
-      event,
-      "```json\n" + JSON.stringify(dumpSession(session), null, 2) + "\n```"
-    );
+    return replyText(event, "```json\n" + JSON.stringify(dumpSession(session), null, 2) + "\n```");
   }
 
   // リセット
@@ -455,21 +490,15 @@ async function handleEvent(event) {
         kind: vision.kind,
         summary: vision.summary || null,
         userIntent: vision.userIntent || null,
-        extractedLinesCount: Array.isArray(vision.extractedLines)
-          ? vision.extractedLines.length
-          : 0,
-        missingQuestions: Array.isArray(vision.missingQuestions)
-          ? vision.missingQuestions
-          : [],
+        extractedLinesCount: Array.isArray(vision.extractedLines) ? vision.extractedLines.length : 0,
+        missingQuestions: Array.isArray(vision.missingQuestions) ? vision.missingQuestions : [],
         at: new Date().toISOString(),
       };
 
       const synthetic =
         vision.suggestedUserText ||
         tidyLines(
-          `（トークスクショ要約）\n${
-            vision.summary || "要約が取れなかった"
-          }\n\n相談：この状況で次の一手を考えて。`
+          `（トークスクショ要約）\n${vision.summary || "要約が取れなかった"}\n\n相談：この状況で次の一手を考えて。`
         );
 
       text = tidyLines(`${synthetic}\n\n（補足）${text}`);
@@ -535,9 +564,45 @@ async function handleEvent(event) {
 
       const advice = buildFreeLightAdvice(session.answers.problem, session.answers.goal);
 
-      return replyText(
-        event,
-        `状況は整理できたわ💋
+      // ✅ ここで Checkout URL を作って「押したら決済へ」のボタンを返す（方式A）
+      try {
+        const u = await getUser(userId);
+        if (isActiveUserRow(u)) {
+          session.state = "PAID_CHAT";
+          return replyText(event, buildPaidContent(session.answers));
+        }
+      } catch {}
+
+      // 連打抑止（60秒）
+      if (session.paid.checkoutIssuedAt && Date.now() - session.paid.checkoutIssuedAt < 60 * 1000) {
+        return replyText(
+          event,
+          `状況は整理できたわ💋
+
+・いまの状況：${session.answers.problem}
+・狙い：${session.answers.goal}
+
+${advice}
+
+――
+有料の決済ボタンを準備中。ちょい待って。`
+        );
+      }
+      session.paid.checkoutIssuedAt = Date.now();
+
+      try {
+        const j = await issueCheckoutUrl(userId);
+
+        if (j.alreadyPaid) {
+          session.state = "PAID_CHAT";
+          return replyText(event, buildPaidContent(session.answers));
+        }
+        if (!j.url) throw new Error("missing checkout url");
+
+        return replyMessages(event, [
+          {
+            type: "text",
+            text: `状況は整理できたわ💋
 
 ・いまの状況：${session.answers.problem}
 ・狙い：${session.answers.goal}
@@ -548,15 +613,48 @@ ${advice}
 ここから先は“設計”になる。
 勝ちたいなら、有料でいく💋
 
-（有料に進むなら「▶ 続きを見る（有料）」って送って）`
-      );
+下のボタン押したら、そのまま決済に飛ぶ。`,
+          },
+          {
+            type: "template",
+            altText: "有料プランの決済はこちら",
+            template: {
+              type: "buttons",
+              title: "サラ（有料）へ進む💋",
+              text: "月額¥980／縛りなし。決済後すぐ続きができる。",
+              actions: [
+                { type: "uri", label: "決済して続きを見る", uri: j.url },
+                { type: "message", label: "やめる（無料に戻る）", text: "やめる" },
+              ],
+            },
+          },
+        ]);
+      } catch (e) {
+        console.error("[PAYWALL] checkout failed", e);
+        return replyText(
+          event,
+          `状況は整理できたわ💋
+
+・いまの状況：${session.answers.problem}
+・狙い：${session.answers.goal}
+
+${advice}
+
+――
+ここから先は“設計”になる。
+勝ちたいなら、有料でいく💋
+
+（決済ボタンの生成で詰まった。もう一回なんか送って）`
+        );
+      }
     }
   }
 
   // --------------------------
-  // 有料ゲート：Checkoutリンクを出す（PAID解放はWebhookで確定）
+  // 有料ゲート：ボタン押したら決済へ（方式A）
+  // - PAID_GATE にいる間は、基本「ボタン再掲」
   // --------------------------
-  if (session.state === "PAID_GATE" && isPaidButtonText(text)) {
+  if (session.state === "PAID_GATE") {
     // すでに課金済みなら即入れる（保険）
     try {
       const u = await getUser(userId);
@@ -566,33 +664,24 @@ ${advice}
       }
     } catch {}
 
-    // 連打でリンク大量発行を抑える（60秒）
-    if (
-      session.paid.checkoutIssuedAt &&
-      Date.now() - session.paid.checkoutIssuedAt < 60 * 1000
-    ) {
+    // 「やめる」でFREEに戻す（任意）
+    if ((text || "").trim() === "やめる") {
+      session.state = "FREE";
       return replyText(
         event,
-        `いま決済リンク作ってる最中💋
-1分だけ待てる？
-（待てないならもう一回送ってもいいけど、リンクが増えるだけよ）`
+        `OK💋 じゃあ無料の範囲で続ける。
+状況の続き、1〜2行で。`
       );
+    }
+
+    // 連打でリンク大量発行を抑える（60秒）
+    if (session.paid.checkoutIssuedAt && Date.now() - session.paid.checkoutIssuedAt < 60 * 1000) {
+      return replyText(event, `いま決済ボタン準備中💋 ちょい待って。`);
     }
     session.paid.checkoutIssuedAt = Date.now();
 
-    const baseUrl = process.env.APP_BASE_URL;
-
     try {
-      if (typeof fetch !== "function") {
-        throw new Error("fetch is not available. Use Node 18+ or install node-fetch.");
-      }
-
-      const r = await fetch(`${baseUrl}/stripe/checkout`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ lineUserId: userId }),
-      });
-      const j = await r.json();
+      const j = await issueCheckoutUrl(userId);
 
       if (j.alreadyPaid) {
         session.state = "PAID_CHAT";
@@ -601,21 +690,13 @@ ${advice}
 
       if (!j.url) throw new Error("missing checkout url");
 
-      return replyText(
-        event,
-        `ここからは設計モード💋
-月額¥980、縛りなし。いつでも解約できる。
-
-▶ 決済して続ける：${j.url}
-
-決済が完了したら、そのままLINEで続けな。`
-      );
+      return replyPayButton(event, j.url);
     } catch (e) {
       console.error("[PAYWALL] checkout failed", e);
       return replyText(
         event,
-        `今、決済リンクの発行で詰まった💋
-もう一回「▶ 続きを見る（有料）」って送って。`
+        `今、決済ボタンの生成で詰まった💋
+もう一回送って。`
       );
     }
   }
