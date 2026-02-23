@@ -127,10 +127,22 @@ function tidyLines(s) {
 }
 
 async function replyText(event, text) {
-  return client.replyMessage(event.replyToken, {
-    type: "text",
-    text: tidyLines(text),
-  });
+  const msg = { type: "text", text: tidyLines(text) };
+  try {
+    return await client.replyMessage(event.replyToken, msg);
+  } catch (e) {
+    console.error("❌ replyMessage failed:", e?.message || e);
+
+    // replyTokenが死んでたら push で救済
+    const userId = event?.source?.userId;
+    if (userId) {
+      try {
+        return await client.pushMessage(userId, msg);
+      } catch (e2) {
+        console.error("❌ pushMessage failed:", e2?.message || e2);
+      }
+    }
+  }
 }
 
 async function replyMessages(event, messages) {
@@ -406,6 +418,18 @@ async function handleEvent(event) {
 
   const session = getSession(userId);
 
+  // ★課金状態：DBが真実（保険）
+  try {
+    const u = await getUser(userId);
+    if (isActiveUserRow(u)) {
+      session.state = "PAID_CHAT";
+    } else {
+      if (session.state === "PAID_CHAT") session.state = "PAID_GATE";
+    }
+  } catch (e) {
+    console.error("[PAID_CHECK] failed", e);
+  }
+
   // 画像メッセージ：即返信＋キュー保存
   if (event.message?.type === "image") {
     try {
@@ -434,20 +458,9 @@ async function handleEvent(event) {
 
   let text = (event.message.text || "").trim();
 
-  // #dump（セッション＋DBの課金状態も確認）
+  // #dump
   if (text === "#dump") {
-    let dbUser = null;
-    try {
-      dbUser = await getUser(userId);
-    } catch (e) {
-      dbUser = { error: "getUser failed", message: e?.message || String(e) };
-    }
-    return replyText(
-      event,
-      "```json\n" +
-        JSON.stringify({ ...dumpSession(session), dbUser }, null, 2) +
-        "\n```"
-    );
+    return replyText(event, "```json\n" + JSON.stringify(dumpSession(session), null, 2) + "\n```");
   }
 
   // リセット
@@ -460,21 +473,6 @@ async function handleEvent(event) {
 状況をそのまま書きなさい。`
     );
   }
-
-
-
-  // ★課金状態：DBが真実（保険）
-  try {
-    const u = await getUser(userId);
-    if (isActiveUserRow(u)) {
-      session.state = "PAID_CHAT";
-    } else {
-      if (session.state === "PAID_CHAT") session.state = "PAID_GATE";
-    }
-  } catch (e) {
-    console.error("[PAID_CHECK] failed", e);
-  }
-
 
   // 🔴 スクショ送付確認は即レス（AI呼ばない）
   if (isScreenshotPermissionText(text)) {
