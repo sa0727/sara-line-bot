@@ -1,6 +1,6 @@
 // stripe_routes.js
 
-console.log("🔥 STRIPE ROUTES VERSION 2026-02-18-A");
+console.log("🔥 STRIPE ROUTES VERSION 2026-02-24-A");
 
 const Stripe = require("stripe");
 const { query } = require("./db");
@@ -108,6 +108,32 @@ async function markProcessed(eventId) {
   );
 }
 
+/**
+ * ✅ 順序ズレ対策：
+ *  - subscription_id で見つからない場合、customer_id でも探す
+ */
+async function findLineUserIdBySubOrCustomer({ subId, customerId }) {
+  if (subId) {
+    const r1 = await query(
+      `select line_user_id from users where stripe_subscription_id=$1 limit 1`,
+      [subId]
+    );
+    const id1 = r1.rows?.[0]?.line_user_id || null;
+    if (id1) return id1;
+  }
+
+  if (customerId) {
+    const r2 = await query(
+      `select line_user_id from users where stripe_customer_id=$1 limit 1`,
+      [customerId]
+    );
+    const id2 = r2.rows?.[0]?.line_user_id || null;
+    if (id2) return id2;
+  }
+
+  return null;
+}
+
 function mountStripeRoutes(app) {
   // Checkout作成（サブスク）
   app.post("/stripe/checkout", app.jsonParser, async (req, res) => {
@@ -125,18 +151,17 @@ function mountStripeRoutes(app) {
       if (!baseUrl) return res.status(500).json({ ok: false, error: "missing_APP_BASE_URL" });
       if (!priceId) return res.status(500).json({ ok: false, error: "missing_STRIPE_PRICE_ID" });
 
+      // （任意）priceの存在確認ログ
       const price = await stripe.prices.retrieve(priceId);
-console.log("✅ PRICE LOOKUP", {
-  id: price.id,
-  livemode: price.livemode,
-  active: price.active,
-  currency: price.currency,
-  unit_amount: price.unit_amount,
-  recurring: price.recurring ? { interval: price.recurring.interval } : null,
-  product: typeof price.product === "string" ? price.product : price.product?.id,
-});
-
-
+      console.log("✅ PRICE LOOKUP", {
+        id: price.id,
+        livemode: price.livemode,
+        active: price.active,
+        currency: price.currency,
+        unit_amount: price.unit_amount,
+        recurring: price.recurring ? { interval: price.recurring.interval } : null,
+        product: typeof price.product === "string" ? price.product : price.product?.id,
+      });
 
       const session = await stripe.checkout.sessions.create({
         mode: "subscription",
@@ -187,6 +212,11 @@ console.log("✅ PRICE LOOKUP", {
   // Webhook（raw body必須）
   app.post("/stripe/webhook", app.rawParser, async (req, res) => {
     let event;
+
+    // ✅ 到達ログ（Renderで確認しやすい）
+    console.log("⚡ /stripe/webhook HIT", new Date().toISOString());
+    console.log("has stripe-signature:", !!req.headers["stripe-signature"]);
+
     try {
       const sig = req.headers["stripe-signature"];
       event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
@@ -201,11 +231,15 @@ console.log("✅ PRICE LOOKUP", {
       }
 
       switch (event.type) {
+        // ✅ Checkout完了：ここで subscription/customer を users に紐付ける
         case "checkout.session.completed": {
           const session = event.data.object;
 
           const lineUserId = session.client_reference_id || session.metadata?.lineUserId;
-          if (!lineUserId) break;
+          if (!lineUserId) {
+            console.log("[stripe/webhook] checkout.session.completed missing lineUserId");
+            break;
+          }
 
           const subId = toId(session.subscription);
           const customerId = toId(session.customer);
@@ -234,21 +268,64 @@ console.log("✅ PRICE LOOKUP", {
           break;
         }
 
+        /**
+         * ✅ 支払い成功（最強に確実）
+         * - subscription の current_period_end を確定値で入れる
+         * - ここで active 化すれば「なぜかPAIDにならない」を潰せる
+         */
+        case "invoice.paid": {
+          const inv = event.data.object;
+
+          const subId = toId(inv.subscription);
+          const customerId = toId(inv.customer);
+          if (!subId || !customerId) {
+            console.log("[stripe/webhook] invoice.paid missing subId/customerId", { subId, customerId });
+            break;
+          }
+
+          const lineUserId = await findLineUserIdBySubOrCustomer({ subId, customerId });
+          if (!lineUserId) {
+            console.log("[stripe/webhook] invoice.paid user not found", { subId, customerId });
+            break;
+          }
+
+          const sub = await stripe.subscriptions.retrieve(subId);
+
+          await upsertUserPaid({
+            lineUserId,
+            stripeCustomerId: customerId,
+            stripeSubscriptionId: subId,
+            status: sub?.status || "active",
+            currentPeriodEndUnix: sub?.current_period_end || null,
+          });
+
+          break;
+        }
+
+        // ✅ サブスク更新：順序ズレでも拾えるよう customer でフォールバック
         case "customer.subscription.updated": {
           const sub = event.data.object;
           const subId = sub?.id;
-          if (!subId) break;
+          const customerId = toId(sub?.customer);
 
-          const r = await query(
-            `select line_user_id from users where stripe_subscription_id=$1 limit 1`,
-            [subId]
-          );
-          const row = r.rows[0];
-          if (!row) break;
+          if (!subId || !customerId) {
+            console.log("[stripe/webhook] subscription.updated missing ids", { subId, customerId });
+            break;
+          }
+
+          const lineUserId = await findLineUserIdBySubOrCustomer({ subId, customerId });
+          if (!lineUserId) {
+            console.log("[stripe/webhook] subscription.updated user not found", {
+              subId,
+              customerId,
+              status: sub.status,
+            });
+            break;
+          }
 
           await upsertUserPaid({
-            lineUserId: row.line_user_id,
-            stripeCustomerId: toId(sub.customer),
+            lineUserId,
+            stripeCustomerId: customerId,
             stripeSubscriptionId: subId,
             status: sub.status,
             currentPeriodEndUnix: sub.current_period_end,
@@ -282,7 +359,8 @@ console.log("✅ PRICE LOOKUP", {
   });
 
   app.get("/billing/cancel", (req, res) => {
-    res.status(200).send("キャンセルOK💋 続けたいならLINEで『▶ 続きを見る（有料）』って送って。");
+    // ※いまは「ボタンで決済へ」方式なので文言も合わせる
+    res.status(200).send("キャンセルOK💋 続けたいならLINEで、もう一回『決済して続きを見る』を押しな。");
   });
 }
 
