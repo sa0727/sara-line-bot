@@ -1,11 +1,10 @@
 // stripe_routes.js
 
-console.log("🔥 STRIPE ROUTES VERSION 2026-02-24-B");
+console.log("🔥 STRIPE ROUTES VERSION 2026-02-26-A");
 
 const Stripe = require("stripe");
 const { query } = require("./db");
 
-// 明示しておくと挙動が安定（任意だが推奨）
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: "2024-06-20",
 });
@@ -39,16 +38,17 @@ async function getUser(lineUserId) {
 }
 
 /**
- * ✅ Unix秒をそのまま受け取り、DB側で to_timestamp() する
- *  - users.current_period_end / paid_until の型ブレ（timestamp vs bigint）地雷を回避
+ * ✅ 42P08対策：timestamptz は明示キャストする
  */
 async function upsertUserPaid({
   lineUserId,
   stripeCustomerId,
   stripeSubscriptionId,
   status,
-  currentPeriodEndUnix, // seconds (number)
+  currentPeriodEndUnix, // seconds
 }) {
+  const paidUntil = currentPeriodEndUnix ? new Date(currentPeriodEndUnix * 1000) : null;
+
   await query(
     `
     insert into users (
@@ -61,9 +61,12 @@ async function upsertUserPaid({
       updated_at
     )
     values (
-      $1,$2,$3,$4,
-      case when $5 is null then null else to_timestamp($5) end,
-      case when $5 is null then null else to_timestamp($5) end,
+      $1::text,
+      $2::text,
+      $3::text,
+      $4::text,
+      $5::timestamptz,
+      $6::timestamptz,
       now()
     )
     on conflict (line_user_id) do update set
@@ -79,7 +82,8 @@ async function upsertUserPaid({
       stripeCustomerId || null,
       stripeSubscriptionId || null,
       status || "inactive",
-      currentPeriodEndUnix ?? null, // ← Unix seconds
+      paidUntil || null,
+      paidUntil || null,
     ]
   );
 }
@@ -141,49 +145,16 @@ async function findLineUserIdBySubOrCustomer({ subId, customerId }) {
 }
 
 /**
- * ✅ invoice系の共通処理（paid/succeeded/paid）：
- *  - subId/customerId からユーザーを引いて、subscription を retrieve して current_period_end を確定
+ * invoice_payment.paid の subscription は深い場所にいることがある（Stripe UIのスクショの形）
  */
-async function handleInvoicePaidLike(event) {
-  const inv = event.data.object;
+function extractSubIdFromInvoicePayment(obj) {
+  // invoice_payment オブジェクトの “parent.subscription_item_details.subscription” を拾う
+  const maybe =
+    obj?.parent?.subscription_item_details?.subscription ||
+    obj?.parent?.subscription ||
+    null;
 
-  const subId = toId(inv.subscription);
-  const customerId = toId(inv.customer);
-
-  console.log("[stripe] invoice paid-like start", {
-    eventType: event.type,
-    invoiceId: inv?.id,
-    subId,
-    customerId,
-  });
-
-  if (!subId || !customerId) {
-    console.log("[stripe] invoice paid-like missing subId/customerId", { subId, customerId });
-    return;
-  }
-
-  const lineUserId = await findLineUserIdBySubOrCustomer({ subId, customerId });
-  if (!lineUserId) {
-    console.log("[stripe] invoice paid-like user not found", { subId, customerId });
-    return;
-  }
-
-  console.log("[stripe] invoice paid-like before retrieve subscription", { subId });
-  const sub = await stripe.subscriptions.retrieve(subId);
-  console.log("[stripe] invoice paid-like after retrieve subscription", {
-    status: sub?.status,
-    current_period_end: sub?.current_period_end,
-  });
-
-  console.log("[stripe] invoice paid-like before upsertUserPaid", { lineUserId });
-  await upsertUserPaid({
-    lineUserId,
-    stripeCustomerId: customerId,
-    stripeSubscriptionId: subId,
-    status: sub?.status || "active",
-    currentPeriodEndUnix: sub?.current_period_end ?? null,
-  });
-  console.log("[stripe] invoice paid-like after upsertUserPaid", { lineUserId });
+  return toId(maybe);
 }
 
 function mountStripeRoutes(app) {
@@ -203,7 +174,6 @@ function mountStripeRoutes(app) {
       if (!baseUrl) return res.status(500).json({ ok: false, error: "missing_APP_BASE_URL" });
       if (!priceId) return res.status(500).json({ ok: false, error: "missing_STRIPE_PRICE_ID" });
 
-      // （任意）priceの存在確認ログ
       const price = await stripe.prices.retrieve(priceId);
       console.log("✅ PRICE LOOKUP", {
         id: price.id,
@@ -225,7 +195,6 @@ function mountStripeRoutes(app) {
         allow_promotion_codes: false,
       });
 
-      // paymentsログ（冪等のため）
       await query(
         `
         insert into payments (checkout_session_id, line_user_id, status)
@@ -235,6 +204,7 @@ function mountStripeRoutes(app) {
         [session.id, lineUserId, "created"]
       );
 
+      // ✅ index.js が j.url を見に行くので “url” は小文字で返す
       return res.json({ ok: true, url: session.url, checkoutSessionId: session.id });
     } catch (e) {
       console.error("[stripe/checkout] error message:", e?.message);
@@ -264,74 +234,46 @@ function mountStripeRoutes(app) {
   app.post("/stripe/webhook", app.rawParser, async (req, res) => {
     let event;
 
-    // ✅ 到達ログ（Renderで確認しやすい）
     console.log("⚡ /stripe/webhook HIT", new Date().toISOString());
     console.log("has stripe-signature:", !!req.headers["stripe-signature"]);
 
-    // 1) 署名検証（ここが落ちたら400）
     try {
       const sig = req.headers["stripe-signature"];
       event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-
-      // ✅ verifiedログ（これが出たら「署名OK＆raw OK」）
-      console.log("[stripe/webhook] verified", {
-        id: event.id,
-        type: event.type,
-        livemode: event.livemode,
-        created: event.created,
-      });
     } catch (err) {
       console.error("[stripe/webhook] signature verify failed", err.message);
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
-    // 2) 本処理（ここで何が起きても必ずレスポンス返す）
     try {
-      // ✅ 冪等
       if (await alreadyProcessed(event.id)) {
-        console.log("[stripe/webhook] dedup skip", { id: event.id, type: event.type });
         return res.status(200).json({ received: true, dedup: true });
       }
 
       switch (event.type) {
-        // ✅ Checkout完了：subscription/customer を users に紐付ける
         case "checkout.session.completed": {
           const session = event.data.object;
 
-          console.log("[stripe] checkout.session.completed start", { sessionId: session?.id });
-
           const lineUserId = session.client_reference_id || session.metadata?.lineUserId;
-          console.log("[stripe] checkout lineUserId", { lineUserId });
-
           if (!lineUserId) {
-            console.log("[stripe] checkout.session.completed missing lineUserId");
+            console.log("[stripe/webhook] checkout.session.completed missing lineUserId");
             break;
           }
 
           const subId = toId(session.subscription);
           const customerId = toId(session.customer);
 
-          console.log("[stripe] checkout ids", { subId, customerId });
-
-          console.log("[stripe] checkout before retrieve subscription");
           let sub = null;
           if (subId) sub = await stripe.subscriptions.retrieve(subId);
-          console.log("[stripe] checkout after retrieve subscription", {
-            status: sub?.status,
-            current_period_end: sub?.current_period_end,
-          });
 
-          console.log("[stripe] checkout before upsertUserPaid");
           await upsertUserPaid({
             lineUserId,
             stripeCustomerId: customerId,
             stripeSubscriptionId: subId,
             status: sub?.status || "active",
-            currentPeriodEndUnix: sub?.current_period_end ?? null,
+            currentPeriodEndUnix: sub?.current_period_end || null,
           });
-          console.log("[stripe] checkout after upsertUserPaid");
 
-          console.log("[stripe] checkout before update payments");
           await query(
             `
             update payments
@@ -341,38 +283,120 @@ function mountStripeRoutes(app) {
             `,
             [session.id, "paid", subId]
           );
-          console.log("[stripe] checkout after update payments");
 
           break;
         }
 
         /**
-         * ✅ 支払い成功（請求が確定して“最強に確実”）
-         *  - Stripe UIでよく出る：invoice.payment.paid / invoice.payment_succeeded / invoice.paid
+         * ✅ invoice.paid（確実）
          */
-        case "invoice.payment.paid":
-        case "invoice.payment_succeeded":
         case "invoice.paid": {
-          await handleInvoicePaidLike(event);
-          break;
-        }
+          const inv = event.data.object;
 
-        // ✅ サブスク更新：順序ズレでも拾えるよう customer でフォールバック
-        case "customer.subscription.updated": {
-          const sub = event.data.object;
-          const subId = sub?.id;
-          const customerId = toId(sub?.customer);
-
-          console.log("[stripe] subscription.updated start", { subId, customerId, status: sub?.status });
-
+          const subId = toId(inv.subscription);
+          const customerId = toId(inv.customer);
           if (!subId || !customerId) {
-            console.log("[stripe] subscription.updated missing ids", { subId, customerId });
+            console.log("[stripe/webhook] invoice.paid missing subId/customerId", { subId, customerId });
             break;
           }
 
           const lineUserId = await findLineUserIdBySubOrCustomer({ subId, customerId });
           if (!lineUserId) {
-            console.log("[stripe] subscription.updated user not found", {
+            console.log("[stripe/webhook] invoice.paid user not found", { subId, customerId });
+            break;
+          }
+
+          const sub = await stripe.subscriptions.retrieve(subId);
+
+          await upsertUserPaid({
+            lineUserId,
+            stripeCustomerId: customerId,
+            stripeSubscriptionId: subId,
+            status: sub?.status || "active",
+            currentPeriodEndUnix: sub?.current_period_end || null,
+          });
+
+          break;
+        }
+
+        /**
+         * ✅ invoice.payment_succeeded も来る環境がある
+         */
+        case "invoice.payment_succeeded": {
+          const inv = event.data.object;
+
+          const subId = toId(inv.subscription);
+          const customerId = toId(inv.customer);
+          if (!subId || !customerId) {
+            console.log("[stripe/webhook] invoice.payment_succeeded missing subId/customerId", { subId, customerId });
+            break;
+          }
+
+          const lineUserId = await findLineUserIdBySubOrCustomer({ subId, customerId });
+          if (!lineUserId) {
+            console.log("[stripe/webhook] invoice.payment_succeeded user not found", { subId, customerId });
+            break;
+          }
+
+          const sub = await stripe.subscriptions.retrieve(subId);
+
+          await upsertUserPaid({
+            lineUserId,
+            stripeCustomerId: customerId,
+            stripeSubscriptionId: subId,
+            status: sub?.status || "active",
+            currentPeriodEndUnix: sub?.current_period_end || null,
+          });
+
+          break;
+        }
+
+        /**
+         * ✅ Stripe UIに出てた invoice_payment.paid 用（subscription が深い）
+         */
+        case "invoice_payment.paid": {
+          const ip = event.data.object;
+
+          const customerId = toId(ip.customer);
+          const subId = extractSubIdFromInvoicePayment(ip);
+
+          if (!customerId || !subId) {
+            console.log("[stripe/webhook] invoice_payment.paid missing ids", { subId, customerId });
+            break;
+          }
+
+          const lineUserId = await findLineUserIdBySubOrCustomer({ subId, customerId });
+          if (!lineUserId) {
+            console.log("[stripe/webhook] invoice_payment.paid user not found", { subId, customerId });
+            break;
+          }
+
+          const sub = await stripe.subscriptions.retrieve(subId);
+
+          await upsertUserPaid({
+            lineUserId,
+            stripeCustomerId: customerId,
+            stripeSubscriptionId: subId,
+            status: sub?.status || "active",
+            currentPeriodEndUnix: sub?.current_period_end || null,
+          });
+
+          break;
+        }
+
+        case "customer.subscription.updated": {
+          const sub = event.data.object;
+          const subId = sub?.id;
+          const customerId = toId(sub?.customer);
+
+          if (!subId || !customerId) {
+            console.log("[stripe/webhook] subscription.updated missing ids", { subId, customerId });
+            break;
+          }
+
+          const lineUserId = await findLineUserIdBySubOrCustomer({ subId, customerId });
+          if (!lineUserId) {
+            console.log("[stripe/webhook] subscription.updated user not found", {
               subId,
               customerId,
               status: sub.status,
@@ -380,65 +404,42 @@ function mountStripeRoutes(app) {
             break;
           }
 
-          console.log("[stripe] subscription.updated before upsertUserPaid", { lineUserId });
           await upsertUserPaid({
             lineUserId,
             stripeCustomerId: customerId,
             stripeSubscriptionId: subId,
             status: sub.status,
-            currentPeriodEndUnix: sub.current_period_end ?? null,
+            currentPeriodEndUnix: sub.current_period_end,
           });
-          console.log("[stripe] subscription.updated after upsertUserPaid", { lineUserId });
 
           break;
         }
 
         case "customer.subscription.deleted": {
           const sub = event.data.object;
-          console.log("[stripe] subscription.deleted start", { subId: sub?.id, status: sub?.status });
-
           if (!sub?.id) break;
           await markUserUnpaidBySubscription(sub.id, sub.status || "canceled");
-
-          console.log("[stripe] subscription.deleted done", { subId: sub?.id });
           break;
         }
 
-        default: {
-          // 追跡しやすいようにログだけ（必要なら後で足す）
-          console.log("[stripe] unhandled event", { type: event.type, id: event.id });
+        default:
           break;
-        }
       }
 
-      // ✅ 冪等マーク（成功時のみ）
       await markProcessed(event.id);
-
       return res.status(200).json({ received: true });
     } catch (e) {
-      console.error("[stripe/webhook] handler error", {
-        message: e?.message,
-        code: e?.code,
-        detail: e?.detail,
-        table: e?.table,
-        routine: e?.routine,
-        stack: e?.stack,
-      });
-
-      // Stripeには「失敗」として見せたいので received:true は返さない
-      return res.status(500).json({ received: false, error: "handler_failed" });
+      console.error("[stripe/webhook] handler error", e);
+      return res.status(500).json({ received: true, error: "handler_failed" });
     }
   });
 
-  // 見た目用（確定はWebhook）
   app.get("/billing/success", (req, res) => {
     res.status(200).send("決済ありがとう💋 LINEに戻って続けな。");
   });
 
   app.get("/billing/cancel", (req, res) => {
-    res
-      .status(200)
-      .send("キャンセルOK💋 続けたいならLINEで、もう一回『決済して続きを見る』を押しな。");
+    res.status(200).send("キャンセルOK💋 続けたいならLINEで、もう一回『決済して続きを見る』を押しな。");
   });
 }
 
