@@ -173,9 +173,13 @@ async function replyPayButton(event, checkoutUrl) {
 }
 
 // 内部：Checkout URL を発行
+// 内部：Checkout URL を発行（デバッグ強化版）
 async function issueCheckoutUrl(lineUserId) {
   const baseUrl = process.env.APP_BASE_URL;
   if (!baseUrl) throw new Error("APP_BASE_URL is not set");
+
+  console.log("🔥 issuing checkout for:", lineUserId);
+  console.log("🔥 baseUrl:", baseUrl);
 
   if (typeof fetch !== "function") {
     throw new Error("fetch is not available. Use Node 18+ or install node-fetch.");
@@ -187,8 +191,20 @@ async function issueCheckoutUrl(lineUserId) {
     body: JSON.stringify({ lineUserId }),
   });
 
-  const j = await r.json();
-  return j;
+  console.log("🔥 checkout status:", r.status);
+
+  const raw = await r.text();
+  console.log("🔥 checkout raw response:", raw);
+
+  if (!r.ok) {
+    throw new Error(`checkout failed: ${r.status} ${raw}`);
+  }
+
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    throw new Error(`checkout JSON parse failed: ${e?.message || e} raw=${raw}`);
+  }
 }
 
 // LINE画像を dataURL に変換
